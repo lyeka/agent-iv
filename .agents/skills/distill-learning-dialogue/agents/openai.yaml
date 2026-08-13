@@ -1,0 +1,7 @@
+interface:
+  display_name: "提炼学习对话"
+  short_description: "将学习对话提炼为保留疑问链、探索过程与认知变化的中间草稿"
+  default_prompt: "使用 $distill-learning-dialogue 将本次学习对话提炼并保存为中间草稿。"
+
+policy:
+  allow_implicit_invocation: false
