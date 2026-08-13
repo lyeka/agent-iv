@@ -1,0 +1,3 @@
+[submodule "related-repos/pi"]
+	path = related-repos/pi
+	url = git@github.com:earendil-works/pi.git

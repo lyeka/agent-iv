@@ -21,7 +21,7 @@
   发现既有约定和技能。`AGENTS.md` 与 `.agents/skills/` 依然是唯一信源，不要
   改动这些符号链接的指向，也不要在 `.claude/` 下另写内容。
 - `origin-docs/`：存放原始资料及其忠实翻译，不存放摘要、批注、学习笔记或观点。
-- `related-repos/`：只以 Git submodule 存放只读参考仓库。
+- `related-repos/`：以 Git submodule 或源码快照存放只读参考仓库。
 - `draft/`：存放从学习对话中提炼的中间过程，不是可直接发布的正式文章。
 - `output/`：存放经过进一步组织的正式文章或其他明确完成的学习成果。
 
