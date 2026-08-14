@@ -1,0 +1,4 @@
+interface:
+  display_name: "技术文章写作"
+  short_description: "研究、撰写与重构主题明确、表达直白自然、图文关系恰当的完整技术文章"
+  default_prompt: "使用 $write-technical-article 撰写或重构一篇言之有物、直白自然、图文互补的技术文章。"
