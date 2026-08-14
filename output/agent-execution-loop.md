@@ -57,27 +57,41 @@ while true:
 
 真正的系统不过是在这副骨架上回答更多问题：`response` 还在流式传输时算不算状态？多个工具如何并发？模型说结束就结束吗？预算在哪一行检查？网络中断后，前一个 attempt 的半成品如何清理？
 
-这些问题适合用 **状态机（state machine）** 建模。状态机的意思不是一定要引入某个框架，而是把“系统现在处于哪个阶段、允许接受什么事件、下一步能去哪里”写成有限且可检查的规则。一个实用的高层状态图如下：
+这些问题适合用 **状态机（state machine）** 建模。状态机的意思不是一定要引入某个框架，而是把“系统现在处于哪个阶段、允许接受什么事件、下一步能去哪里”写成有限且可检查的规则。
+
+先不展开网络重试、输出截断和中断恢复，只看一个简化但完整的 Agent loop：
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Preparing
-    Preparing --> Streaming: 发起模型请求
-    Streaming --> Settling: 收到终止事件
-    Streaming --> Reconciling: 中断或流异常
-    Settling --> ToolPreflight: 存在完整工具调用
-    Settling --> Deciding: 没有工具调用
-    ToolPreflight --> ToolExecuting: 参数与权限通过
-    ToolPreflight --> Committing: 拒绝或参数非法
-    ToolExecuting --> Committing: 收集全部结果
-    Committing --> Deciding: 调用与结果已配对
-    Reconciling --> Deciding: 半成品已作废或补齐
-    Deciding --> Preparing: 需要继续
-    Deciding --> Terminal: 满足终止条件
+    direction TB
+
+    state "准备本轮" as PreparingTurn
+    state "调用模型" as CallingModel
+    state "处理模型响应" as HandlingResponse
+    state "检查并执行工具" as RunningTools
+    state "记录工具结果" as RecordingToolResults
+    state "判断继续还是结束" as DecidingNextStep
+    state "结束运行" as Terminal
+
+    [*] --> PreparingTurn
+    PreparingTurn --> CallingModel: 上下文和工具已经准备好
+    CallingModel --> HandlingResponse: 收到本次响应
+    HandlingResponse --> RunningTools: 响应中有工具调用
+    HandlingResponse --> DecidingNextStep: 响应中没有工具调用
+    RunningTools --> RecordingToolResults: 工具执行完成
+    RecordingToolResults --> DecidingNextStep: 工具结果已经加入上下文
+    DecidingNextStep --> PreparingTurn: 需要下一轮
+    DecidingNextStep --> Terminal: 可以结束
     Terminal --> [*]
 ```
 
-图中的 **reconciliation（对账/调和）**，是把中断后互相矛盾的状态重新整理为合法状态。例如消息里存在一个 `tool_use`，却没有对应的 `tool_result`，运行时就要补一个“已中断”的合成结果，或者把整个未提交 attempt 作废。它不是“尽量修修”，而是在恢复系统不变量。
+一次循环从准备上下文开始。运行时把已有消息、系统提示和当前可用工具整理好，然后调用模型。模型返回后，运行时读取响应内容，先看其中有没有工具调用。这一步不能只看模型给出的停止原因，因为真正决定下一步的是响应里实际出现了什么。
+
+如果响应中有工具调用，运行时就检查参数和权限，执行工具，再把结果加入上下文。这里的结果不只包括成功值，也包括工具报错、参数不合法或调用被拒绝。模型必须在下一轮看到这些结果，才能继续判断任务是否完成，所以工具调用不是循环的终点，而是连接前后两个 turn 的中间步骤。
+
+如果响应中没有工具调用，或者工具结果已经记录完成，运行时就判断是否还需要下一轮。需要继续时，系统带着更新后的上下文重新调用模型；不需要继续时，整个 run 结束。这个判断由运行时负责，模型的停止原因只是其中一个输入，宿主追加的新消息或强制停止条件也会改变结果。
+
+因此，一个 Agent loop 的核心可以归纳为五步：准备上下文、调用模型、处理响应、执行并记录工具结果、判断是否继续。图中所谓“完整”，指这条主控制流能够从开始走到结束，也能够在工具结果返回后进入下一轮；重试、截断、fallback 和用户中断，是在这条主干上继续增加的生产环境处理，后文再分别展开。
 
 ## 2. PI：先看一颗足够小、又真实可用的内核
 
@@ -98,7 +112,7 @@ PI 每个 turn 的主要顺序是：
 注入 pending message
 → streamAssistantResponse
 → 从最终消息中筛出 toolCall
-→ 工具预检和执行
+→ 工具调用检查和执行
 → 把 toolResult 写回上下文
 → turn_end
 → prepareNextTurn / shouldStopAfterTurn
@@ -120,11 +134,11 @@ PI 每个 turn 的主要顺序是：
 
 这么做的理由很现实：工具参数在流式阶段可能只是 `{"path":"/tmp`，甚至尚未形成合法 JSON。把 partial 当成可执行命令，会让网络分包方式决定业务行为。
 
-PI 的 [`packages/agent/README.md`](../related-repos/pi/packages/agent/README.md) 还特意提醒：低层 `agentLoop()` 发出的事件是 observational，也就是用于观察；它不会等待异步事件监听器全部处理完再推进生产者。如果宿主需要“消息监听已经处理完成，工具预检才能开始”这样的屏障，应使用更高层的 `Agent`。这说明流式事件通道和控制流屏障最好显式区分，不能假设“监听器收到了事件”就等于“系统已经落稳”。
+PI 的 [`packages/agent/README.md`](../related-repos/pi/packages/agent/README.md) 还特意提醒：低层 `agentLoop()` 发出的事件是 observational，也就是用于观察；它不会等待异步事件监听器全部处理完再继续。如果宿主要求“消息监听处理完成后才能检查工具调用”，应使用更高层的 `Agent` 来保证这个先后顺序。监听器收到了事件，并不等于系统已经完成这一步。
 
 ### 2.3 决定继续的是实际工具调用，不是一个标签
 
-PI 的 `AssistantMessage` 带有 `stopReason`，可取 `stop`、`length`、`toolUse`、`error`、`aborted` 等值。这里的 **provider（模型服务提供方）** 是实际接收请求并返回模型响应的 API 服务；运行时通常还会在它前面放一层 adapter，把不同厂商的事件转换成统一格式。**Stop reason（停止原因）**就是 provider 对“这次生成为什么结束”的协议级说明，例如自然结束、达到输出上限或开始使用工具。它很有用，但不是完整的业务裁决。
+PI 的 `AssistantMessage` 带有 `stopReason`，可取 `stop`、`length`、`toolUse`、`error`、`aborted` 等值。这里的 **provider（模型服务提供方）** 是实际接收请求并返回模型响应的 API 服务；运行时通常还会在它前面放一层 adapter，把不同厂商的事件转换成统一格式。**Stop reason（停止原因）**就是 provider 对“这次生成为什么结束”的协议级说明，例如自然结束、达到输出上限或开始使用工具。它很有用，但不能单独决定整个 Agent 是否结束。
 
 `runLoop` 只把 `error` 和 `aborted` 直接视为终止错误。对于工具，它没有写成：
 
@@ -150,7 +164,7 @@ PI 把工具调用分成三个阶段，很值得借鉴：
 
 这里的 **hook（钩子）** 是插在固定生命周期节点上的宿主回调。它不是让模型自由发挥的提示词，而是程序侧的扩展点，例如在工具执行前做权限判断、执行后脱敏结果。
 
-PI 支持串行和并行两种工具执行。如果配置要求串行，或者批次中任何一个工具声明 `executionMode="sequential"`，整批就串行；否则先预检所有调用，再用 `Promise.all` 并发执行。即使并行完成顺序不同，结果仍按原工具调用顺序回填，从而保持稳定的协议顺序。
+PI 支持串行和并行两种工具执行。如果配置要求串行，或者批次中任何一个工具声明 `executionMode="sequential"`，整批就串行；否则先检查所有调用，再用 `Promise.all` 并发执行。即使并行完成顺序不同，结果仍按原工具调用顺序回填，从而保持稳定的消息顺序。
 
 工具还可以在结果中设置 `terminate=true`，表示“这个工具的结果本身就是终点，不必再花一轮让模型复述”。但 PI 的 `shouldTerminateToolBatch` 要求**批次中每一个结果都同意终止**。如果两个并行调用中，一个是“提交最终答案”，另一个仍需要模型解释错误，仅凭前者就结束会丢失后续工作。全体同意才停，是一种保守的批次语义。
 
@@ -160,9 +174,9 @@ PI 提供 `prepareNextTurn`，允许宿主在 turn 边界替换上下文、模�
 
 它没有在最小 loop 里硬编码统一的步数、token 或美元成本策略。这不是“功能缺失”那么简单，而是一种分层：低层 loop 保证消息与工具协议，高层宿主决定产品预算。PI 更高层的 durable harness 则进一步引入持久化状态、retry policy 和恢复流程，见 [`packages/agent/docs/harness.md`](../related-repos/pi/packages/agent/docs/harness.md)。
 
-## 3. 停止不是一个布尔值，而是一场分层裁决
+## 3. 停止不是一个布尔值，而是由多层共同判断
 
-朴素实现常写成 `if model_finished: break`。生产系统更适合把“停止”理解为多个裁决者按优先级合并后的结果。
+朴素实现常写成 `if model_finished: break`。生产系统需要综合模型响应、工具执行状态、预算和用户操作，再按优先级判断是否停止。
 
 | 终止来源 | 典型信号 | 最合适的拦截层 | 为什么放在这里 |
 |---|---|---|---|
@@ -172,7 +186,7 @@ PI 提供 `prepareNextTurn`，允许宿主在 turn 边界替换上下文、模�
 | 单次输出上限 | `max_tokens`、`length` | Provider adapter + recovery policy | 先识别截断，再决定提高额度、续写或失败 |
 | 总 token / 成本预算 | 累计 usage 或美元成本超限 | Host / session | 预算往往跨多个请求甚至跨压缩边界 |
 | 用户中断 | `AbortSignal` | 从 host 向下传播到模型和工具 | 取消必须能打断网络等待、退避睡眠和工具进程 |
-| 工具主动终止 | `terminate=true`、提交结果工具 | Tool executor + loop | 必须先把结果提交并保证整个批次语义一致 |
+| 工具主动终止 | `terminate=true`、提交结果工具 | Tool executor + loop | 必须先记录结果，并保证整个批次的处理方式一致 |
 | Stop hook 拦截 | 验证失败、合规检查不通过 | Loop 的终止边界 | 它检查的是候选最终结果，而不是模型请求本身 |
 
 **Orchestrator（编排器）**就是协调模型、工具、队列和策略的那层控制程序；本文中的核心 loop 正是最小编排器。
@@ -193,7 +207,7 @@ Claude Code 展示了这些限制如何落到不同位置：
 
 ```text
 可以正常结束 =
-    响应已经落稳
+    模型响应已经整理完成
     且没有待处理或未配对的工具调用
     且最终输出满足契约
     且没有 steering / follow-up / stop-hook 续跑要求
@@ -237,7 +251,7 @@ Claude Code 在 [`src/services/api/claude.ts`](../related-repos/claude-code/src/
 
 因此可以提炼出一条通用规则：
 
-> 文本可以续写；未提交的工具调用只能重新生成。任何“看起来解析成功”的残缺参数，都不应越过响应落稳边界。
+> 文本可以续写；尚未完整生成的工具调用只能重新生成。任何“看起来解析成功”的残缺参数，都不能直接交给工具执行。
 
 ## 5. Fallback：切换模型之前，先处理旧世界
 
@@ -270,7 +284,7 @@ Claude Code 至少处理了两类 fallback。
 
 Claude Code 的 `claude.ts` 留有一段很关键的实现注释：流式阶段若已经启动工具，随后再做非流式 fallback，新响应可能再次生成同一个工具调用，造成重复执行。因此代码提供了禁用这条 fallback 的开关，在相应条件下让错误向上传播。
 
-这暴露了所有 Agent 都必须面对的提交点问题：
+这暴露了所有 Agent 都必须回答的一个关键问题：什么时候还可以安全重试？
 
 ```text
 模型调用可以重试的安全窗口：尚未开始外部副作用
@@ -291,7 +305,7 @@ type AttemptState = {
 
 一旦 `effectsStarted=true`，整轮 fallback 只能走三条路之一：工具本身支持幂等重放；运行时能查询并复用第一次结果；或者终止并要求人工确认。所谓 **幂等（idempotency）**，是同一个操作执行一次或重复执行多次，最终效果相同。例如“把任务状态设为 completed”可以设计成幂等，而“账户余额减 100”天然不是；后者通常需要带稳定的幂等键，让服务端识别重复请求并返回第一次结果。
 
-## 6. 流式输出：更快，但把故障窗口拉长了
+## 6. 流式输出：更快，但中途失败更难处理
 
 等待完整响应后再执行工具，最容易保证一致性，却会浪费时间：模型可能先完整生成了第一个工具调用，之后还要思考很久才结束整条响应。Claude Code 的 `StreamingToolExecutor` 选择在完整 `tool_use` block 到达后尽早启动工具。
 
@@ -306,10 +320,10 @@ type AttemptState = {
 
 流式执行的收益是降低延迟，代价是形成新的不确定窗口：模型响应尚未结束，外部副作用已经开始。所以推荐把实现分成两个级别：
 
-- 默认模式：响应完全落稳后才执行工具，适合高风险写操作。
+- 默认模式：完整收完并确认响应后才执行工具，适合高风险写操作。
 - 优化模式：完整工具块到达即可执行，但仅对只读、可取消或有幂等保护的工具开放。
 
-无论哪种模式，都应满足一个协议不变量：每个已经提交给历史的工具调用，最终必须有对应结果。用户中断也不能只 `return`；PI 和 Claude Code 都会把异常或中断转成工具结果或中断消息，避免下一次 API 请求看到孤儿 `tool_use`。
+无论哪种模式，都必须保证：每个已经写入消息历史的工具调用，最终都有对应结果。用户中断也不能只 `return`；PI 和 Claude Code 都会把异常或中断转成工具结果或中断消息，避免下一次 API 请求看到只有 `tool_use`、没有结果的消息。
 
 ## 7. 结构化输出：合法 JSON 还不够
 
@@ -396,26 +410,27 @@ intent(invocationId, tool, args_hash)
 → settlement(invocationId, result_or_error)
 ```
 
-这里的 `intent` 是执行意图，必须在副作用开始前记录；`settlement` 是结果落账，表示这次调用已经确定成功或失败。恢复时若只看到 intent，看不到 settlement，系统不能直接假设“没执行”，而应先查询下游或进入人工确认。
+这里的 `intent` 是执行意图，必须在副作用开始前记录；`settlement` 是最终结果记录，表示这次调用已经确定成功或失败。恢复时若只看到 intent，看不到 settlement，系统不能直接假设“没执行”，而应先查询下游或进入人工确认。
 
 PI 的 durable harness 文档把这个思想做得更完整：它用 `op.state/{operationId}` 保存完整的当前程序计数状态，在不确定副作用前写入 `effect_pending` 意图；已结算的响应与 usage 一起持久化。恢复不是凭“消息列表最后一条像什么”来猜，而是读取明确状态再分支。这类 **durable execution（持久化执行）** 的目标，是进程崩溃后仍能从已记录边界继续，而不重复已经确认的效果。
 
 AWS 的[幂等 API 指南](https://docs.aws.amazon.com/wellarchitected/2022-03-31/framework/rel_prevent_interaction_failure_idempotent.html)也采用同一原则：客户端重发时携带相同 token，服务端识别并返回第一次处理结果。真正的幂等是协议双方合作，不是客户端在内存里加一个布尔变量。
 
-## 9. 把结论收束成一台可实现的状态机
+## 9. 把前面的结论写成可实现的状态机
 
-前面从简单循环一路走到截断、fallback 和持久化，最后可以把推荐设计压缩成三类显式类型：
+前面从简单循环一路走到截断、fallback 和持久化，最后可以把推荐设计整理成三组类型：
 
 ```ts
 type LoopPhase =
-  | "preparing"
-  | "streaming"
-  | "settling"
-  | "tool_preflight"
-  | "tool_executing"
-  | "committing"
-  | "reconciling"
-  | "deciding"
+  | "preparing_turn"
+  | "calling_model"
+  | "finalizing_response"
+  | "preparing_retry"
+  | "checking_tool_calls"
+  | "running_tools"
+  | "recording_tool_results"
+  | "repairing_interrupted_state"
+  | "deciding_next_step"
   | "terminal"
 
 type TerminalReason =
@@ -438,28 +453,28 @@ type LoopState = {
 }
 ```
 
-这些类型不是 PI 或 Claude Code 的原样 API，而是基于两份实现提炼出的推荐模型。关键不在字段名，而在于让故障窗口成为状态，而不是散落在十几个布尔变量和消息数组的隐含关系里。
+这些类型不是 PI 或 Claude Code 的原样 API，而是基于两份实现整理出的推荐模型。关键不在字段名，而在于明确记录程序执行到哪一步、出错后允许做什么，不要把这些信息藏在十几个布尔变量和消息数组里。
 
-统一的裁决顺序可以写成：
+判断是否继续可以按下面的顺序进行：
 
 ```text
 1. 先处理用户取消和不可恢复错误
 2. 再修复未配对的工具调用/结果
-3. 若有完整工具调用，先预检、执行并提交整批结果
+3. 若有完整工具调用，先检查参数和权限，再执行并记录整批结果
 4. 在 turn 边界检查步数、token、成本和工具终止
 5. 运行结构化输出、测试、合规等 stop hook
 6. 检查 steering / follow-up 队列
 7. 全部通过，才接受模型的自然结束
 ```
 
-这套顺序背后有四条比具体框架更稳定的不变量：
+无论具体框架怎样变化，下面四件事都必须保证：
 
-1. **每个已提交的工具调用最终都有对应结果。** 成功、失败、拒绝、中断都必须闭合协议。
-2. **未落稳的流式片段不能产生不受保护的副作用。** 提前执行只对可证明完整且可安全重放的调用开放。
-3. **已经产生副作用的 turn 不能盲目重放。** 必须使用幂等键、结果账本、补偿操作或人工确认。
-4. **每一条继续路径都有边界。** 步数、token、成本、重试次数、总时长或用户中断，至少有一种能终止它。
+1. **每个已经记录的工具调用最终都有对应结果。** 成功、失败、拒绝和中断都不能留下只有调用、没有结果的消息。
+2. **尚未完整收完的流式内容不能产生不受保护的副作用。** 提前执行只对已经完整形成、并且能够安全重复执行的调用开放。
+3. **已经产生副作用的 turn 不能盲目重放。** 必须使用幂等键、已保存的工具结果、补偿操作或人工确认。
+4. **每一条继续路径都有停止办法。** 步数、token、成本、重试次数、总时长或用户中断，至少有一种能结束循环。
 
-到这里，核心 loop 已不再是一句“不断调用模型直到它说完成”，而是一台小型事务协调器：模型提出下一步，执行引擎验证输入、管理副作用、记录结果，再决定这个下一步是否真的成立。
+到这里，核心 loop 已不再是一句“不断调用模型直到它说完成”，而是一段负责控制执行顺序和风险的程序：模型提出下一步，执行引擎检查输入、管理副作用、记录结果，再决定是否真的继续。
 
 ---
 
@@ -471,19 +486,19 @@ type LoopState = {
 
 > Agent loop 不应被理解成“模型没说 stop 就一直 while”。分析这类系统时，首先要把一次运行拆成 run、turn、model attempt 和 tool batch 四层：一次 turn 是一条模型响应加上它触发的一批工具；一次 turn 里可能因为网络重试包含多个模型 attempt。这样发生错误时，才能明确应该重试的是网络请求、整个模型轮次，还是某个工具，而不是笼统地“再来一次”。
 >
-> 状态机通常可分成准备上下文、模型流式生成、响应落稳、工具预检、工具执行、结果提交、统一裁决和终止几个阶段。流式 delta 只给 UI 展示，只有收到完整结束事件、工具参数也通过 schema 校验后，才形成可执行的规范状态。工具结果无论成功、失败、权限拒绝还是用户中断，都必须和原来的 tool call 配对，不能给下一轮留下孤儿调用。
+> 状态机通常可分成准备本轮、调用模型、整理并确认响应、检查工具调用、执行工具、记录工具结果、判断是否继续和结束运行几个阶段。流式 delta 只给 UI 展示，只有收到完整结束事件、工具参数也通过 schema 校验后，才能交给后续程序处理。工具结果无论成功、失败、权限拒绝还是用户中断，都必须和原来的 tool call 配对，不能给下一轮留下只有调用、没有结果的消息。
 >
-> 停止方面，模型的 stop reason 只能作为输入，不能充当最终裁决。PI 和 Claude Code 都会看响应里实际有没有 tool call；Claude Code 源码还明确写了 `stop_reason=tool_use` 不总是可靠。最终能不能停，要同时满足：没有待执行工具、输出已经落稳且符合契约、没有 steering 或 follow-up、stop hook 没有拦截，并且没有其他续跑策略。另一方面，步数、token、成本、用户取消属于硬边界，应该由 loop 或宿主直接拦，不需要征求模型意见。
+> 停止方面，模型的 stop reason 只能作为输入，不能单独决定整个 run 是否结束。PI 和 Claude Code 都会看响应里实际有没有 tool call；Claude Code 源码还明确写了 `stop_reason=tool_use` 不总是可靠。最终能不能停，要同时满足：没有待执行工具、模型响应已经整理完成且输出符合要求、没有 steering 或 follow-up、stop hook 没有要求继续，并且没有其他续跑策略。另一方面，步数、token、成本和用户取消属于强制停止条件，应该由 loop 或宿主直接检查，不需要征求模型意见。
 >
-> 截断处理需要区分文本和工具。文本可以提高输出额度或者追加“从中断处继续”的元消息；残缺工具调用不能靠猜测补 JSON 后执行。PI 在 `length` 时会把这一批工具调用全部标成失败，让模型重新发完整调用；Claude Code 会先尝试提高输出额度，再做有次数上限的续写。核心原则是：未落稳的工具调用不产生副作用。
+> 截断处理需要区分文本和工具。文本可以提高输出额度或者追加“从中断处继续”的元消息；残缺工具调用不能靠猜测补 JSON 后执行。PI 在 `length` 时会把这一批工具调用全部标成失败，让模型重新发完整调用；Claude Code 会先尝试提高输出额度，再做有次数上限的续写。核心原则是：尚未完整生成并确认的工具调用不能产生副作用。
 >
-> 主模型失败切备用模型时，旧 attempt 应被视为一个待对账事务：已经流给 UI 的半成品要 tombstone，旧工具调用要补错误结果或作废，旧 executor 和调用 ID 要丢弃，模型绑定的 thinking signature 也不能跨模型复用。但消息清理不能撤销外部副作用，所以一旦 `effectsStarted=true`，就不能盲目整轮重放；必须依赖幂等键、结果查询或人工确认。
+> 主模型失败切备用模型时，必须先处理旧 attempt 留下的状态：已经流给 UI 的半成品要 tombstone，旧工具调用要补错误结果或作废，旧 executor 和调用 ID 要丢弃，模型绑定的 thinking signature 也不能跨模型复用。但消息清理不能撤销外部副作用，所以一旦 `effectsStarted=true`，就不能盲目整轮重放；必须依赖幂等键、结果查询或人工确认。
 >
-> 流式工具执行是一种延迟优化，不是默认正确性。只读、可取消或幂等的工具，可以在完整 tool block 到达后提前执行；高风险写操作最好等整条响应落稳。结构化输出则要用 strict schema 或专门的提交结果工具，在运行时再次校验，失败后把精确错误反馈给模型，但必须设置最大修复次数，并单独处理 refusal 和 token 截断。
+> 流式工具执行是一种降低延迟的优化，不是默认正确性。只读、可取消或幂等的工具，可以在完整 tool block 到达后提前执行；高风险写操作最好等整条响应收完并确认。结构化输出则要用 strict schema 或专门的提交结果工具，在运行时再次校验，失败后把精确错误反馈给模型，但必须设置最大修复次数，并单独处理 refusal 和 token 截断。
 >
 > 最后是重试。瞬时错误和确定性错误必须分开处理：网络失败、超时、429、部分 5xx 可以在没有副作用的请求层做有界重试，尊重 `Retry-After`，使用指数退避加 jitter，并让用户取消能打断等待；参数错误、配额耗尽、安全拒绝不应该机械重试。重试只放在一个明确层级，防止 SDK、provider 和 Agent 三层相乘。对写操作使用稳定 invocation ID 和下游幂等键，必要时在执行前记 intent、执行后记 settlement。
 >
-> 所以，核心 loop 可以归纳为：模型负责提出下一步，执行引擎负责验证、落账、控制风险，并决定是否真的继续。
+> 所以，核心 loop 可以归纳为：模型负责提出下一步，执行引擎负责检查、记录结果、控制风险，并决定是否真的继续。
 
 这段回答的结构不是罗列功能，而是先说明建模单位，再讲正常路径，接着讲停止和故障，最后落到重试与幂等。即使面试官中途打断，也能沿任一关键词继续追问。
 
@@ -491,19 +506,19 @@ type LoopState = {
 
 ### 追问一：一个 loop 里具体干哪几件事？状态机怎么建模？
 
-一次 turn 通常包含：准备上下文和工具定义、调用模型并消费流、把响应落稳、提取完整工具调用、校验参数与权限、串行或并行执行工具、按原顺序回填结果、累计 usage，最后统一判断继续或终止。推荐显式记录 `phase`、`turn`、`attemptId`、`responseSettled`、`effectsStarted`、待处理工具 ID 和累计预算，不从消息数组临时反推所有状态。
+一次 turn 通常包含：准备上下文和工具定义、调用模型并消费流、整理并确认响应、提取完整工具调用、校验参数与权限、串行或并行执行工具、按原顺序记录结果、累计 usage，最后判断继续或终止。推荐显式记录 `phase`、`turn`、`attemptId`、`responseSettled`、`effectsStarted`、待处理工具 ID 和累计预算，不从消息数组临时反推所有状态。
 
 PI 的 `runLoop` 把模型响应、工具批次和 turn 边界写得很清楚；Claude Code 的 `queryLoop` 则用一个跨迭代 `State` 保存压缩追踪、截断恢复次数、turn count 和 transition reason。两种实现共同说明：消息历史是业务数据，但“程序现在执行到哪”最好由独立状态记录。
 
 ### 追问二：模型返回的停止信号到底可不可信？
 
-它可信到“可以描述本次 provider 响应为什么停”，但不可信到“可以决定整个 Agent run 已完成”。运行时应把 stop reason 和响应内容交叉验证：实际存在工具调用就处理工具；`length` 就走截断恢复；`error`、`aborted` 走失败收尾。只有响应落稳、无待处理工具、输出合法、宿主也没有续跑要求时，才接受自然结束。
+它可信到“可以描述本次 provider 响应为什么停”，但不可信到“可以决定整个 Agent run 已完成”。运行时应把 stop reason 和响应内容交叉验证：实际存在工具调用就处理工具；`length` 就走截断恢复；`error`、`aborted` 走失败收尾。只有模型响应已经整理完成、没有待处理工具、输出合法、宿主也没有续跑要求时，才接受自然结束。
 
 源码里的处理与这个判断一致：PI 直接从 content 中筛 `toolCall`；Claude Code 也根据实际 `tool_use` block 设置 `needsFollowUp`，并在注释中指出单独依赖 `stop_reason === 'tool_use'` 不可靠。背后的原则是“结构事实优先于摘要标签”。
 
 ### 追问三：几类终止条件分别在哪一层拦？
 
-- 模型自然结束：在 loop 的最终裁决阶段接受。
+- 模型自然结束：在 loop 最后判断是否继续时接受。
 - 步数上限：在完整 turn 边界检查，先补齐本轮工具结果。
 - 单次输出 token 上限：provider adapter 识别，交给恢复策略提高额度或续写。
 - 总 token、任务预算和成本预算：由会话宿主累计并拦截。
@@ -511,13 +526,13 @@ PI 的 `runLoop` 把模型响应、工具批次和 turn 边界写得很清楚；
 - 工具主动终止：工具 executor 提交结果后，由 loop 结束，不再额外调用模型。
 - Hook 或策略拦截：在候选结束点运行；失败可以要求继续，但必须有次数上限。
 
-这种分层也反映在源码中：Claude Code 把 `maxTurns` 放在工具执行后，把 `maxBudgetUsd` 放在 `QueryEngine` 的消息消费层；PI 则用 `shouldStopAfterTurn` 给宿主注入策略。终止条件并不是越早检查越好，而应放在不会破坏协议不变量的位置。
+这种分层也反映在源码中：Claude Code 把 `maxTurns` 放在工具执行后，把 `maxBudgetUsd` 放在 `QueryEngine` 的消息消费层；PI 则用 `shouldStopAfterTurn` 让宿主提供停止规则。终止条件并不是越早检查越好，而要保证已经出现的工具调用都有对应结果。
 
 ### 追问四：输出被 token 上限截断，末尾还有残缺工具调用，整批作废还是续写？
 
 先区分文本和工具。纯文本可以先提高单次额度，或者把已完成文本放回历史后要求模型从中断处继续。工具调用如果没有完成提交，就整批或至少整个未提交调用作废，重新生成；不能让模型“续写后半段 JSON”再和前半段拼接执行。若无法证明同批其他调用完整，整批作废最稳妥。
 
-PI 对 `length` 消息中的整批调用都回填错误，不执行任何一个；Claude Code 对 `max_output_tokens` 先暂扣错误，可选升级到 64K，再做最多三次续写。两者的恢复策略不同，但共同边界都是“不把未落稳的片段直接当工具输入”。
+PI 对 `length` 消息中的整批调用都回填错误，不执行任何一个；Claude Code 对 `max_output_tokens` 先暂扣错误，可选升级到 64K，再做最多三次续写。两者的恢复策略不同，但共同原则都是“不把尚未完整收完并确认的内容直接当工具输入”。
 
 ### 追问五：主模型失败切备用模型，半成品状态怎么处理？
 
@@ -527,9 +542,9 @@ Claude Code 的流式 fallback 正是这样处理：先 tombstone 旧 assistant 
 
 ### 追问六：流式输出如何和 loop 结合？
 
-流事件和规范状态应走两条逻辑通道：delta 可以实时更新 UI 和进度，但只有 final event 才能提交 assistant message。工具也必须等到完整 block、参数校验和权限检查通过后才能执行。流异常或取消时，要停止接收更新、取消可取消工具，并为已经出现的调用生成配对结果。
+流事件和最终确认的消息应分开处理：delta 可以实时更新 UI 和进度，但只有 final event 才能提交 assistant message。工具也必须等到完整 block、参数校验和权限检查通过后才能执行。流异常或取消时，要停止接收更新、取消可取消工具，并为已经出现的调用生成配对结果。
 
-如果要做流式工具执行，只对并发安全、可取消或幂等工具开放；结果可以并行计算，但回填顺序保持稳定。高风险写工具默认等完整响应落稳。
+如果要做流式工具执行，只对并发安全、可取消或幂等工具开放；结果可以并行计算，但回填顺序保持稳定。高风险写工具默认等完整响应收完并确认。
 
 PI 会用最终消息替换上下文中的 partial；Claude Code 的 `StreamingToolExecutor` 对并发安全工具并行、对非并发安全工具独占，并把最终结果按原调用顺序输出。用户中断时，两者都不会简单丢弃生成器，而是修复工具调用与结果的配对。
 
@@ -549,7 +564,7 @@ PI 的 `retryAssistantCall` 是一个边界清楚的请求级重试器：abort �
 
 ### 追问九：如果只能保留几条设计原则，应当保留什么？
 
-可以保留四条：第一，结构化内容比 stop 标签更可信；第二，流式片段和最终规范状态分离；第三，每个工具调用必须有结果，已经产生副作用的 turn 不能盲目重放；第四，所有继续路径都必须有预算或取消出口。
+可以保留四条：第一，结构化内容比 stop 标签更可信；第二，流式片段和最终确认的消息分开处理；第三，每个工具调用必须有结果，已经产生副作用的 turn 不能盲目重放；第四，所有继续路径都必须有预算或取消出口。
 
 这四条能覆盖绝大多数实现差异。框架会变、模型协议会变，但“不要执行半成品、不要重复副作用、不要留下孤儿状态、不要无限循环”不会变。
 
@@ -557,11 +572,11 @@ PI 的 `retryAssistantCall` 是一个边界清楚的请求级重试器：abort �
 
 最小 Agent loop 的确可以写成几十行：调用模型、执行工具、回填结果、继续循环。PI 证明了这个内核可以保持清楚；Claude Code 则展示了产品进入真实环境后，截断、流式 fallback、预算、hook、并行工具和中断如何把每一个简单判断变成状态边界。
 
-理解源码的目的，不是背下 `runLoop` 或 `queryLoop` 的函数名，而是看见它们共同守护的东西：完整响应与半成品的边界、模型建议与运行时裁决的边界、可重试计算与不可重复副作用的边界。
+理解源码的目的，不是背下 `runLoop` 或 `queryLoop` 的函数名，而是看见它们共同守护的东西：完整响应与半成品的区别、模型建议与运行时决定的区别、可以重试的计算与不能重复的外部操作之间的区别。
 
 把这些边界建模清楚以后，核心执行循环才真正成立：
 
-> **模型负责提出下一步，执行引擎负责验证、落账、控制风险，并决定是否真的继续。**
+> **模型负责提出下一步，执行引擎负责检查、记录结果、控制风险，并决定是否真的继续。**
 
 ---
 
@@ -587,5 +602,5 @@ PI 的 `retryAssistantCall` 是一个边界清楚的请求级重试器：abort �
 ### 官方资料
 
 - Anthropic：[Stop reasons and fallback](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons)、[Define tools](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools)。
-- OpenAI：[Function calling](https://developers.openai.com/api/docs/guides/function-calling)、[Structured model outputs](https://developers.openai.com/api/docs/guides/structured-outputs)。
+- OpenAI：[Agents SDK agent loop](https://openai.github.io/openai-agents-python/running_agents/)、[Function calling](https://developers.openai.com/api/docs/guides/function-calling)、[Structured model outputs](https://developers.openai.com/api/docs/guides/structured-outputs)。
 - AWS Well-Architected Framework：[Control and limit retry calls](https://docs.aws.amazon.com/wellarchitected/latest/framework/rel_mitigate_interaction_failure_limit_retries.html)、[Make all responses idempotent](https://docs.aws.amazon.com/wellarchitected/2022-03-31/framework/rel_prevent_interaction_failure_idempotent.html)。
