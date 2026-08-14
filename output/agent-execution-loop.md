@@ -172,49 +172,131 @@ PI 支持串行和并行两种工具执行。如果配置要求串行，或者�
 
 PI 提供 `prepareNextTurn`，允许上层应用在一个 turn 结束后替换上下文、模型或 reasoning level（模型的推理强度）；又提供 `shouldStopAfterTurn`，让上层应用在工具全部结束、`turn_end` 已经发出之后增加停止条件。
 
-它没有在最小 loop 里硬编码统一的步数、token 或美元成本限制。低层 loop 负责正确保存模型消息，并保证每个工具调用都有结果；运行 Agent 的上层应用负责产品侧的步数和预算规则。PI 更高层的 **durable harness（可恢复运行层）** 包在低层 loop 外，负责保存执行进度、设置 retry policy，并在进程中断后从已保存的位置继续，见 [`packages/agent/docs/harness.md`](../related-repos/pi/packages/agent/docs/harness.md)。例如，工具执行前保存“准备调用哪个工具”，进程重启后就能先确认该工具是否已经执行，而不是直接再调用一次。
+它没有在最小 loop 里硬编码统一的步数、token 或美成本限制。低层 loop 负责正确保存模型消息，并保证每个工具调用都有结果；运行 Agent 的上层应用负责产品侧的步数和预算规则。PI 更高层的 **durable harness（可恢复运行层）** 包在低层 loop 外，负责保存执行进度、设置 retry policy，并在进程中断后从已保存的位置继续，见 [`packages/agent/docs/harness.md`](../related-repos/pi/packages/agent/docs/harness.md)。例如，工具执行前保存“准备调用哪个工具”，进程重启后就能先确认该工具是否已经执行，而不是直接再调用一次。
 
-## 3. 停止不是一个布尔值，而是由多层共同判断
+## 3. 从 `stop_reason` 到下一步：模型停了，Agent 不一定结束
 
-朴素实现常写成 `if model_finished: break`。生产系统需要综合模型响应、工具执行状态、预算和用户操作，再按优先级判断是否停止。
+拿到一次模型响应后，运行时首先要判断它是最终回答、工具请求、截断内容还是拒绝；处理完这次响应后，还要判断 Agent 是否有事情需要下一 turn，以及是否允许再次调用模型。本节就沿着这条顺序展开。
 
-| 终止来源 | 典型信号 | 最合适的拦截层 | 为什么放在这里 |
-|---|---|---|---|
-| 模型自然结束 | `end_turn`、`stop`，且无工具调用 | Loop / 调度程序 | Provider 只知道本次生成，不知道上层应用是否还有消息和任务 |
-| 模型或请求失败 | `error`、不可恢复的 4xx | 模型适配层 + loop | 适配层把不同服务的错误转成统一格式，loop 负责生成最终错误结果 |
-| 步数上限 | `turnCount > maxTurns` | Loop | 只有 loop 知道完整 turn 已经结束 |
-| 单次输出上限 | `max_tokens`、`length` | 模型适配层 + 恢复程序 | 先识别截断，再决定提高额度、续写或失败 |
-| 总 token / 成本预算 | 累计 usage 或美元成本超限 | 会话管理程序 | 预算通常要累计多个模型请求，不能只看单次响应 |
-| 用户中断 | `AbortSignal` | 从上层应用传到模型和工具 | 取消必须能打断网络等待、退避等待和工具进程 |
-| 工具主动终止 | `terminate=true`、提交结果工具 | 工具执行程序 + loop | 必须先记录结果，并保证同一批工具都已处理完 |
-| Stop hook（停止钩子）拦截 | 验证失败、合规检查不通过 | Loop 准备结束时 | 它检查模型提交的最终结果，而不是检查网络请求 |
+下面使用 Anthropic Messages API 举例，因为 Claude Code 直接使用这套消息格式，PI 也包含对应的 Anthropic adapter。不同 LLM API 的具体字段并不统一：有些使用 `stop_reason`，有些通过响应状态、结束原因、输出条目或流式结束事件表达相近信息；工具调用的字段和结束事件也可能不同。实现多模型 Agent 时，需要为每个 provider 编写转换层。可以复用的是后面的判断顺序，不能直接复用 Anthropic 的字段枚举。
 
-**Orchestrator（调度程序）**是负责调用模型、执行工具、处理待办消息并决定是否继续的程序；本文中的核心 loop 就承担这些工作。例如，模型返回 `tool_use` 后，由调度程序调用工具并把结果交回下一轮。
+### 3.1 先看 Anthropic：`stop_reason` 只说明这次生成为什么停
 
-表中的 `AbortSignal` 是 JavaScript 生态常用的协作式取消信号：上层应用把同一个“已取消”状态传给网络请求、定时等待和工具进程，各层看到信号后自行尽快退出。它不是强制杀掉线程，因此工具仍要负责关闭子进程、释放连接，并返回中断结果。
+例如，Anthropic Messages API 可能返回下面这条响应：
 
-表中的 **Stop hook（停止钩子）**则是模型准备结束后、运行时正式接受结果前执行的程序化检查。例如模型说“修改完成”时，Stop hook 可以检查测试是否通过；若不通过就把错误送回下一轮，而不是接受这次结束。
-
-Claude Code 展示了这些限制如何落到不同位置：
-
-- [`src/query.ts`](../related-repos/claude-code/src/query.ts) 在工具批次结束、结果回填后检查 `maxTurns`。这样即使刚好达到上限，也不会留下只有 `tool_use`、没有 `tool_result` 的消息。
-- [`src/QueryEngine.ts`](../related-repos/claude-code/src/QueryEngine.ts) 逐条处理 query 产出的消息，累计 usage（输入、输出和缓存 token 等用量）与成本，并在达到 `maxBudgetUsd` 后返回专门的错误结果。成本限制属于会话管理程序，而不是单个 provider 请求。由于本次费用通常要等响应返回后才能确定，`maxBudgetUsd` 只能阻止后续请求，不能承诺总费用一分钱也不超；如果预算绝不能超过某个数，请求前还要按本次可能产生的最高费用预留额度。
-- 同一文件还统计模型按指定 JSON Schema 提交最终结果的尝试次数，达到上限后返回 `error_max_structured_output_retries`。
-- `query.ts` 的本地 token-budget 功能并不只是达到数字就立即停止：预算尚未使用到目标比例时，它可能加入一条提醒消息，让模型继续完成任务；达到约定阈值，或者连续几轮消耗 token 却几乎没有新增有效输出时，才停止。
-- `taskBudget` 又是另一层概念：它会随请求传给支持任务预算的 API；上下文压缩后，程序会重新计算并传入剩余额度。不能把单次 `max_tokens`、本地 turn token 目标和服务端 task budget 混成一个数字。
-
-把这些条件合在一起，可以得到一个比“信不信模型”更准确的终止公式：
-
-```text
-可以正常结束 =
-    模型响应已经完整收完并确认
-    且没有待执行或缺少结果的工具调用
-    且最终输出符合指定格式和业务要求
-    且 steering / follow-up / stop hook 都没有要求继续运行
-    且没有更高优先级的错误、中断或预算终止
+```json
+{
+  "stop_reason": "tool_use",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "toolu_01",
+      "name": "read_file",
+      "input": { "path": "app.yaml" }
+    }
+  ]
+}
 ```
 
-模型自然结束只是一个检查条件，运行时仍要做最后判断。
+模型此时已经停止生成，但任务显然没有完成。`tool_use` 表示模型正在等待应用读取工具调用、执行 `read_file`，再把结果放进下一次请求。Anthropic 的[停止原因说明](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons)列出了下面几种常见情况：
+
+| Anthropic `stop_reason` | 这次生成发生了什么 | 应用接下来做什么 |
+|---|---|---|
+| `end_turn` | 模型到达自然停止点 | 检查实际输出和待处理消息；满足整个 run 的完成条件后才能结束 |
+| `tool_use` | 模型正在等待客户端工具结果 | 从 `content` 中读取完整的 `tool_use` block，校验、执行并返回 `tool_result` |
+| `max_tokens` / `model_context_window_exceeded` | 响应被输出上限或上下文窗口截断 | 进入截断恢复，不能执行可能残缺的工具调用 |
+| `stop_sequence` | 命中了调用方设置的停止序列 | 查看具体命中的序列，并按它在应用中的用途处理 |
+| `pause_turn` | Anthropic 的服务端工具循环达到单次请求的迭代上限 | 保留已有 assistant 内容和工具配置，再发一次请求让服务端工具循环继续 |
+| `refusal` | 模型拒绝完成请求 | 读取拒绝信息，返回拒绝或按产品策略切换模型，不能当作普通格式错误反复重试 |
+
+这里的 `pause_turn` 是 Anthropic 服务端工具特有的返回值，不是 Agent loop 通用的“暂停状态”。客户端工具仍以 `tool_use` 返回，由应用执行并提交 `tool_result`。
+
+`stop_reason` 属于成功返回的 Messages API 响应。网络超时、连接失败等情况可能根本没有完整响应，自然也没有可用的 `stop_reason`，这些故障要交给第 8 节的请求重试处理。未知停止原因也不能默认当作 `end_turn`：PI 的 [`mapStopReason`](../related-repos/pi/packages/ai/src/api/anthropic-messages.ts) 对无法识别的值直接抛错，避免 provider 新增枚举后被旧程序误判成正常完成。
+
+### 3.2 为什么不能只写 `switch (stop_reason)`
+
+`stop_reason` 是重要输入，但它不能代替对实际响应内容的检查。PI 与 Claude Code 都体现了这一点：
+
+| 实现 | 源码实际做法 | 说明 |
+|---|---|---|
+| PI Anthropic adapter | `mapStopReason` 把 `end_turn`、`max_tokens`、`tool_use`、`refusal` 等值转换成 PI 内部的 `stop`、`length`、`toolUse` 和 `error` | 多 provider 系统需要先把不同 API 的返回方式转换成内部统一表示 |
+| PI `runLoop` | 完成转换后，仍从 `message.content` 中筛选真实的 `toolCall` | 内部停止原因也不能代替实际内容检查 |
+| PI 截断处理 | `stopReason === "length"` 时不执行消息中的工具调用，而是为整批调用生成错误结果 | 停止原因和实际内容必须结合判断 |
+| Claude Code `queryLoop` | 源码明确注明 `stop_reason === 'tool_use'` 不总可靠；观察到真实 `tool_use` block 才设置 `needsFollowUp` | 是否进入工具流程应以真实工具块为准 |
+| [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/running_agents/) | 只有已经得到最终输出并且不存在工具调用时才结束；存在工具调用就执行并把结果加入下一轮 | 不同 provider 的字段不同，但都要检查模型实际返回了什么 |
+
+因此，provider 的结束字段用来解释这次生成为什么停，模型实际返回的内容决定接下来要处理什么。多模型 Agent 可以先通过 adapter 把不同 provider 的返回格式转换成内部表示，但转换后的状态仍要与真实文本、工具调用和错误内容一起判断。
+
+### 3.3 从一次模型响应，上升到整个 run 的继续与结束
+
+3.1 解释了 provider 为什么停止生成，3.2 进一步说明 adapter 不能只转换停止字段，还要检查实际返回的内容。不过，这两步仍然只解决“一次模型请求该怎样处理”。生产级 Agent 还要继续向外判断：当前 turn 是否已经处理完整，整个 run 是否还有后续工作，以及步数、预算和用户操作是否允许再次调用模型。
+
+下面这张图把三个范围套在一起：一个 run 包含多个 turn，一个 turn 又可能包含多个 model attempt。它是结合 PI 与 Claude Code 整理出的工程抽象，不是任一项目的原样 API。
+
+```mermaid
+flowchart TB
+    subgraph RUN["一个 run：从收到任务到最终结束"]
+        direction TB
+        MODEL_ERROR(["整个 run 结束<br/>model_error"])
+
+        subgraph TURN["一个 turn：得到一条模型响应，并处理它触发的工具"]
+            direction TB
+
+            subgraph ATTEMPT["一次 model attempt：向 provider 发起一次请求"]
+                direction LR
+                CALL["调用 provider"] --> ADAPTER["转换停止信息<br/>检查实际 content"]
+                ADAPTER --> RESPONSE{"当前响应能继续处理吗？"}
+                RESPONSE -- "截断或临时失败" --> RETRY["恢复当前请求<br/>发起新的 model attempt"]
+                RETRY -. "仍在当前 turn" .-> CALL
+                RESPONSE -- "无法恢复" --> MODEL_ERROR
+                RESPONSE -- "可以" --> CONFIRMED["确认模型响应"]
+            end
+
+            CONFIRMED --> TOOLS["处理完整的工具调用"]
+            TOOLS --> RESULTS["记录每个工具结果<br/>没有工具则直接完成 turn"]
+        end
+
+        RESULTS --> WORK{"还有下一 turn 的工作吗？"}
+        MORE["工具结果还需分析<br/>steering / follow-up 还有消息<br/>Stop hook 要求修复"] -. "影响判断" .-> WORK
+        WORK -- "没有" --> DONE(["正常完成<br/>completed"])
+        WORK -- "有" --> ALLOWED{"允许再调用一次模型吗？"}
+        LIMITS["maxTurns<br/>累计 token / 成本<br/>工具、策略或上层应用明确停止"] -. "限制下一次请求" .-> ALLOWED
+        ALLOWED -- "不允许" --> LIMITED(["按具体原因结束<br/>max_turns / token_budget / cost_budget / policy"])
+        ALLOWED -- "允许" --> NEXT["开始下一 turn<br/>重新进入 model attempt"]
+
+        CANCEL["全程都可能发生<br/>用户取消或不可恢复的内部错误"]
+        CANCEL -. "中断模型请求、等待或工具" .-> CLEANUP["停止当前工作<br/>补上必要的中断结果"]
+        CLEANUP --> ABORTED(["结束<br/>user_aborted / runtime_error"])
+    end
+```
+
+最里面的 model attempt 只负责拿到一条可用的模型响应。网络临时失败、输出截断或 fallback 可能产生新的 attempt，但它们不会自动开始新的 turn。响应可以继续处理后，程序才进入 turn 的其余部分：检查实际工具调用，执行完整调用，并为每个调用记录成功、失败、拒绝或中断结果。普通工具失败通常也是一个 `tool_result`，不等于整个 run 失败。
+
+当前 turn 处理完整后，run 先判断还有没有事情需要模型处理。工具结果需要分析、steering 或 follow-up 队列还有消息、Stop hook 要求修复，都会产生下一 turn；这些情况都不存在时才是正常完成。确实需要下一 turn 时，程序才检查 `maxTurns`、累计 token、成本和停止策略，决定是否允许再次发起模型请求。
+
+用户取消不属于上述顺序中的某一步。它可能发生在模型生成、退避等待或工具执行期间，因此必须能立即传给当前请求和可取消工具；退出前还要为已经记录的工具调用补上中断结果。用户追加消息则相反：它会增加待处理工作，通常推动 loop 进入下一 turn。
+
+#### 生产级 loop 在决定继续或结束时检查什么
+
+下面的表格不是简单罗列“停止原因”，而是把可能要求恢复、继续或结束的条件放在一起。阅读时要注意四个区别：`max_tokens` 表示单次响应被截断，不是整个 run 的 token 预算；用户追加消息和用户取消的作用相反；普通工具失败通常交给模型继续处理；只有已经没有后续工作时，才可以把结果称为 `completed`。
+
+| 影响范围 | 需要检查的情况 | 检查时间 | 运行时怎样处理 | 典型结果 |
+|---|---|---|---|---|
+| Model attempt | 单次响应截断或临时请求失败 | 收到截断响应或请求失败时 | 不执行残缺工具调用；重试、续写或 fallback | 通常仍在当前 turn，不直接结束 run |
+| Model attempt | 拒绝或无法恢复的模型错误 | 当前请求处理完成后 | 保留具体错误并停止自动恢复 | `model_error` 或产品定义的拒绝结果 |
+| Turn | 工具结果还需分析、steering/follow-up 还有消息、Stop hook 要求修复 | 工具结果全部记录后 | 标记仍需要下一 turn | 如果运行限制允许，则继续 |
+| Turn | 没有工具结果要处理、没有待处理消息，也没有修复要求 | 当前 turn 完整处理后 | 正常返回最终输出 | `completed` |
+| Run 全程 | 用户取消 | 模型生成、退避等待或工具执行期间均可发生 | 取消当前工作，为已记录的工具调用补上中断结果 | `user_aborted` |
+| 下一 turn 前 | `maxTurns` 已达到 | 当前 turn 完成后、下一次模型请求前 | 不再发起模型请求 | `max_turns` |
+| 下一 turn 前 | 累计 token 达到限制 | 更新本轮 usage 后 | 不再发起模型请求 | `token_budget` |
+| 下一 turn 前 | 累计成本达到限制 | 更新本轮费用后 | 不再发起模型请求；可能出现一次请求范围内的小幅超限 | `cost_budget` |
+| Turn 或 run | 工具明确要求结束整个 run | 工具结果记录完成后 | 根据工具执行器与上层 loop 的约定结束 | `tool_terminated` |
+| Run | 策略、Stop hook 或上层应用明确禁止继续 | 检查最终输出或准备下一次请求时 | 保留禁止原因并结束 | `policy_blocked` |
+| Run 全程 | 无法恢复的内部运行错误 | 错误发生时 | 停止当前工作，完成必要清理后结束 | 推荐记录为 `runtime_error` |
+
+表中的检查位置可以在源码中找到对应依据。PI 先记录工具结果并发出 `turn_end`，再调用 `shouldStopAfterTurn`，steering 和 follow-up 还能增加下一轮工作；它也会让 `error` 和 `aborted` 直接结束当前路径。Claude Code 提供了 `max_turns`、`aborted_streaming`、`aborted_tools` 和 Stop hook 等具体结果，并在 [`QueryEngine`](../related-repos/claude-code/src/QueryEngine.ts) 中使用 `maxBudgetUsd` 阻止后续请求。
+
+累计 token 硬上限，以及统一的 `token_budget`、`cost_budget`、`runtime_error` 等结束原因，是基于这些源码提出的推荐设计，不是 PI 或 Claude Code 的原样 API。Claude Code 的 `taskBudget`、本地 `tokenBudget` 和单次 `max_tokens` 也有不同用途，不能合并成同一个限制。PI 工具结果里的 `terminate` 已在 2.4 解释；它是否结束整个 run，仍取决于工具执行器和外层循环的约定。
 
 ## 4. 输出被截断：最危险的不是少了一段文字
 
@@ -436,6 +518,7 @@ type LoopPhase =
 type TerminalReason =
   | "completed"
   | "model_error"
+  | "runtime_error"
   | "max_turns"
   | "token_budget"
   | "cost_budget"
@@ -453,7 +536,7 @@ type LoopState = {
 }
 ```
 
-这些类型不是 PI 或 Claude Code 的原样 API，而是根据两份实现整理出的建议数据结构。字段名可以调整，但程序至少要单独记录当前步骤、turn、model attempt、待处理工具 ID、累计用量和结束原因。这样出错后才能直接判断可以重试哪一步，不必从消息数组和十几个布尔变量中反推。`preparing_retry` 表示同一 turn 内准备重试模型请求；`repairing_interrupted_state` 表示工具可能已经执行，需要先查询结果或停止，不能直接再次执行。这两个阶段属于生产环境中的异常处理，所以没有放进第 1 节的简化主图。
+这些类型不是 PI 或 Claude Code 的原样 API，而是根据两份实现整理出的建议数据结构。字段名可以调整，但程序至少要单独记录当前步骤、turn、model attempt、待处理工具 ID、累计用量和结束原因。这样出错后才能直接判断可以重试哪一步，不必从消息数组和十几个布尔变量中反推。`preparing_retry` 表示同一 turn 内准备重试模型请求；`repairing_interrupted_state` 表示工具可能已经执行，需要先查询结果或停止，不能直接再次执行。这两个阶段属于生产环境中的异常处理，所以没有放进第 1 节的简化主图。`runtime_error` 用于循环程序或工具执行器自身无法恢复的错误，避免把它误记为模型错误。这里的 `tool_terminated` 是推荐设计中的 run 级结束原因，只有工具或上层应用明确要求结束整个 run 时才使用，不能直接等同于 PI 工具结果里的 `terminate` 字段。
 
 判断是否继续可以按下面的顺序进行：
 
@@ -461,7 +544,7 @@ type LoopState = {
 1. 先处理用户取消和不可恢复错误
 2. 再为缺少结果的工具调用补上错误结果，或者明确将调用作废
 3. 若有完整工具调用，先检查参数和权限，再执行并记录整批结果
-4. 这一 turn 的响应和工具结果都处理完后，再检查步数、token、成本和工具终止
+4. 这一 turn 的响应和工具结果都处理完后，再检查步数、token、成本，以及工具或上层应用是否禁止下一轮
 5. 运行 stop hook，检查结构化输出、测试结果或合规要求
 6. 检查 steering / follow-up 队列
 7. 全部通过，才接受模型的自然结束
@@ -488,7 +571,7 @@ type LoopState = {
 >
 > 状态机通常可分成准备本轮、调用模型、处理模型响应、检查并执行工具、记录工具结果、判断是否继续和结束运行几个阶段。流式 delta 可以用于 UI 实时展示，但工具只能读取已经完整生成并通过 schema 校验的参数。无论工具成功、失败、被权限检查拒绝还是被用户中断，都要为原来的 tool call 生成一个结果，不能让下一轮只看到调用、看不到结果。
 >
-> 停止方面，模型的 stop reason 只能说明本次生成为什么停止，不能单独决定整个 run 是否结束。PI 和 Claude Code 都会检查响应里实际有没有 tool call；Claude Code 源码还明确写了 `stop_reason=tool_use` 不总是可靠。最终能不能停，要同时满足：没有待执行工具、模型响应完整且输出符合要求、steering、follow-up 和 stop hook 都没有要求继续。另一方面，步数、token、成本和用户取消属于强制停止条件，应该由 loop 或上层应用直接检查，不需要征求模型意见。
+> 模型停止生成后，先看 provider 返回的停止信息，再看实际输出内容。以 Anthropic 为例，`end_turn` 表示自然停止，`tool_use` 表示等待客户端工具结果，`max_tokens` 表示响应被截断；其他 LLM API 的字段和值可能不同，需要先由 adapter 转换。这一步仍只决定当前 model attempt 怎样处理：临时失败或截断可能在同一 turn 内产生新的 attempt，无法恢复才按错误结束。拿到可用响应后，程序还要处理完整个 turn，为每个工具调用记录结果；随后判断工具结果、steering、follow-up 和 Stop hook 是否产生了下一 turn。确实需要继续时，最后检查 `maxTurns`、累计 token、成本和策略是否允许再次调用模型。没有后续工作是正常完成，有后续工作但受到限制则要带着具体原因结束；用户取消则可以在上述任意阶段中断当前工作。
 >
 > 截断处理需要区分文本和工具。文本可以提高输出额度，或者加入一条消息要求模型“从中断处继续”；残缺工具调用不能靠猜测补 JSON 后执行。PI 在 `length` 时会把这一批工具调用全部标成失败，让模型重新发完整调用；Claude Code 会先尝试提高输出额度，再做有次数上限的续写。重要规则是：尚未完整生成并确认的工具调用不能产生副作用。
 >
@@ -512,21 +595,19 @@ PI 的 `runLoop` 清楚标出了模型响应、工具批次和一个 turn 在哪
 
 ### 追问二：模型返回的停止信号到底可不可信？
 
-Stop reason 可以用来判断本次 provider 响应为什么停止，但不能证明整个 Agent run 已完成。运行时还要检查响应内容：实际存在工具调用就处理工具；`length` 就处理截断；`error`、`aborted` 就生成对应的失败或中断结果。只有模型响应完整、没有待处理工具、输出符合要求，而且上层应用没有要求继续时，才接受自然结束。
+停止信号可以相信，但只能相信它描述的那一层。以 Anthropic 为例，`end_turn` 表示模型自然停止生成，`tool_use` 表示模型在等待客户端工具结果，`max_tokens` 表示这次响应被截断；它们都没有直接回答整个 Agent run 是否完成。其他 LLM API 的字段和值可能不同，所以多模型 Agent 通常先用 adapter 转换，再进入统一的 loop。
 
-源码里的处理与这个判断一致：PI 直接从 content 中筛 `toolCall`；Claude Code 也根据实际 `tool_use` block 设置 `needsFollowUp`，并在注释中指出单独依赖 `stop_reason === 'tool_use'` 不可靠。实际出现的工具调用比 stop reason 更能说明下一步该做什么。
+转换后的停止原因也不能代替内容检查。PI 仍从 content 中筛选真实 `toolCall`；Claude Code 也根据实际 `tool_use` block 设置 `needsFollowUp`，源码注释还明确指出单独依赖 `stop_reason === 'tool_use'` 不可靠。处理完实际内容和工具结果后，运行时再判断是否还需要下一 turn；如果需要，还要检查步数、预算和用户取消是否允许继续。
 
 ### 追问三：几类终止条件分别在哪一层拦？
 
-- 模型自然结束：在 loop 最后判断是否继续时接受。
-- 步数上限：等这一 turn 的工具结果全部保存后再检查。
-- 单次输出 token 上限：模型适配层识别，再由恢复程序决定提高额度、续写还是返回失败。
-- 总 token、任务预算和成本预算：由会话管理程序累计并检查。
-- 用户中断：由上层应用发出统一取消信号，传给网络请求、退避等待和工具进程。
-- 工具主动终止：工具 executor 先提交结果，再由 loop 结束，不额外调用模型；PI 还要求同一批工具的每个结果都设置 `terminate=true`，避免一个工具提前结束整批工作。
-- Hook 或策略拦截：在模型准备结束时运行；检查失败可以要求继续，但必须限制次数。
+可以沿着 model attempt、turn 和 run 三个范围回答。单次输出的 `length` 或 `max_tokens` 属于 model attempt：它表示当前响应不完整，恢复程序可以提高额度、续写或重新请求；只有无法恢复时才按模型错误结束，不能把它当成整个 run 的 token 预算。
 
-这种分工也反映在源码中：Claude Code 在工具执行并记录结果后检查 `maxTurns`，由 `QueryEngine` 逐条处理消息并累计 `maxBudgetUsd`；PI 则用 `shouldStopAfterTurn` 让上层应用提供停止规则。终止条件并不是越早检查越好，还要保证已经出现的工具调用都有对应结果。
+进入 turn 后，程序先处理实际工具调用并记录每个结果。工具结果还需分析、steering 或 follow-up 还有消息、Stop hook 要求修复，都表示需要下一 turn；这些条件都不存在时才是 `completed`。普通工具报错一般作为 `tool_result` 交给模型，不会直接结束 run。工具或策略明确要求停止时，也要先记录工具结果，再按约定返回 `tool_terminated` 或 `policy_blocked`。
+
+确定仍有后续工作后，run 才在下一次模型请求前检查 `maxTurns`、累计 token 和成本；达到限制就分别以 `max_turns`、`token_budget` 或 `cost_budget` 结束。用户取消和无法恢复的内部错误不必等待上述检查，可以在模型生成、退避等待或工具执行期间中断；退出前仍要取消当前工作，并为已经记录的工具调用补上必要的中断结果。
+
+PI 的顺序是先记录工具结果并发出 `turn_end`，再执行 `shouldStopAfterTurn`，随后检查 steering 和 follow-up。Claude Code 同样在工具结果完成后检查 `maxTurns`，`QueryEngine` 再根据已经返回的 usage 累计 `maxBudgetUsd`。因此，这些限制的作用不是把当前 turn 截断，而是阻止下一次模型请求。
 
 ### 追问四：输出被 token 上限截断，末尾还有残缺工具调用，整批作废还是续写？
 
@@ -586,6 +667,7 @@ PI 的 `retryAssistantCall` 只负责模型请求：abort 和配额类错误不�
 
 - [`packages/agent/src/agent-loop.ts`](../related-repos/pi/packages/agent/src/agent-loop.ts)：`runLoop`、`streamAssistantResponse`、`failToolCallsFromTruncatedMessage`、`executeToolCalls*`、`shouldTerminateToolBatch`。
 - [`packages/agent/src/types.ts`](../related-repos/pi/packages/agent/src/types.ts)：`AgentLoopConfig`、`shouldStopAfterTurn`，以及工具结果中 `terminate` 字段的含义。
+- [`packages/ai/src/api/anthropic-messages.ts`](../related-repos/pi/packages/ai/src/api/anthropic-messages.ts)：Anthropic `stop_reason` 到 PI 内部停止原因的 `mapStopReason` 转换。
 - [`packages/ai/src/types.ts`](../related-repos/pi/packages/ai/src/types.ts)：`StopReason`、`AssistantMessage` 和流事件类型。
 - [`packages/ai/src/utils/retry.ts`](../related-repos/pi/packages/ai/src/utils/retry.ts)：`retryAssistantCall`、`isRetryableAssistantError`。
 - [`packages/agent/docs/harness.md`](../related-repos/pi/packages/agent/docs/harness.md)：durable program counter、effect intent、执行后结果记录、恢复和 usage ledger。
