@@ -11,7 +11,7 @@ description: 研究、撰写、重写、润色或审查完整的 Markdown 技术
 
 开始写作或重构前，完整阅读 [references/writing-principles.md](references/writing-principles.md)。它定义“言之有物”、白描式技术表达和图文互补的具体判断方法。
 
-遇到以下情况时，再完整阅读 [references/case-study.md](references/case-study.md)：
+遇到以下情况时，再完整阅读 [references/case-study.md](references/case-study.md)。它是一组使用不同技术情境构造的通用诊断案例，只提供开始判断的引子：
 
 - 文章主题或章节职责难以确定；
 - 内容虽然技术上正确，却显得空泛、机械或难以理解；
@@ -19,7 +19,7 @@ description: 研究、撰写、重写、润色或审查完整的 Markdown 技术
 - 不确定是否需要图、应使用什么图，或图文怎样分工；
 - 需要从反复返工的技术文章中吸取写作经验。
 
-不要把案例文章的目录、章节或写法当成模板。案例用于识别问题和理解判断过程。
+不要把案例中的主题、标题、句式或诊断字段当成正文模板。先把案例映射到当前文章的对象、关系和读者缺口；关系不同时，只保留仍然成立的判断方法，不复用具体解法。
 
 ## 确定任务与产物
 
