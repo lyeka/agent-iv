@@ -23,7 +23,8 @@ Agent 的上下文不能和会话记录画等号。会话记录可以完整保�
 flowchart LR
     A["稳定规则<br/>系统指令、项目约定"] --> E["本轮请求构建"]
     B["会话快照<br/>启动目录、初始 Git 状态"] --> E
-    C["逐轮变化<br/>用户输入、权限变化、工具结果"] --> E
+    C["逐轮变化<br/>用户输入、工具结果、运行状态"] --> M["筛选并生成<br/>模型可见内容"]
+    M --> E
     D["完整会话记录"] --> F{"是否超出预算"}
     F -->|否| E
     F -->|接近上限| G["裁剪旧结果或摘要旧历史"]
@@ -99,18 +100,53 @@ OpenAI 的 Chat Completions 用 `messages` 保存有序消息，用 `tools` 描�
 | 协议位置 | 在 Agent 中常见的内容 |
 |---|---|
 | `system` / `developer` | Agent 行为、安全和长期规则 |
-| `user` | 用户任务，以及 Agent 注入的项目说明和环境材料 |
+| `user` | 用户任务，以及 Agent 注入的项目说明、环境材料和必要的状态提醒 |
 | `assistant` | 模型此前生成的文本或工具调用 |
 | `tool` | Agent 运行时执行工具后取得的结果 |
 | `tools` | 模型当前可以调用的接口定义 |
 
 角色只说明内容在协议中的位置，不保证它来自谁。示例第一条 `user` 同时包含项目约束、工作目录和用户任务，其中前两项可以由 Agent 注入；`assistant` 是模型的历史输出，不是 Agent 运行时的全部状态。CLAUDE.md、环境快照和历史摘要也不是 API 的专用字段，Agent 必须先把它们整理成文本，再放入 provider 支持的位置。
 
+#### PI：运行状态如何变成模型请求
+
+上面的 JSON 仍然隐藏了一步：Agent 内存中的状态远比 LLM API 能接收的内容丰富，不能直接序列化后发给模型。PI 的[状态与消息模型](https://github.com/earendil-works/pi/blob/46bb9a2c3bdb296b0d2179f7309ec6b79a7f3106/packages/agent/src/types.ts)把这层差异写进了类型设计：`AgentState` 保存完整状态，一次运行开始时再从中复制模型调用需要的部分。
+
+```text
+AgentState
+├─ systemPrompt、messages、tools → 本次运行的 AgentContext
+├─ model、thinkingLevel          → 模型调用配置
+└─ streaming、pending、error     → 运行时控制与观察
+
+AgentMessage[]
+→ 上下文筛选和补充
+→ LLM 消息转换
+→ Provider 适配
+→ Wire request
+```
+
+`AgentContext` 是本次运行的上下文快照，只包含 system prompt、消息和工具。`AgentMessage` 是 PI 应用层的消息联合类型，既有标准用户、模型和工具结果消息，也允许应用加入自定义类型。进入 provider 层前，消息先经过裁剪或外部材料注入，再转换成通用的 `Message`：UI-only 内容被过滤，需要让模型知道的自定义消息则改写成 LLM 能接收的形式。
+
+| PI 中的状态 | 在运行时的作用 | 怎样进入 LLM API |
+|---|---|---|
+| `systemPrompt` | 保存当前基础提示 | 转成 provider 的 system 或 developer 内容 |
+| `messages` | 保存会话历史和应用自定义消息 | 筛选、转换后进入有序消息历史 |
+| `tools` | 同时包含 schema 和本地执行能力 | 只发送名称、说明和参数 schema |
+| `model`、`thinkingLevel` | 决定模型和推理配置 | 进入顶层请求参数，不作为消息正文 |
+| `isStreaming`、`streamingMessage` | 表示响应是否仍在生成 | 不直接发送；完成后才成为 assistant 历史 |
+| `pendingToolCalls` | 跟踪尚未完成的工具调用 | 留在 Agent loop；完成后生成配对的工具结果 |
+| `errorMessage` | 记录最近一次失败或中止 | 不直接发送；恢复需要时必须另行生成模型消息 |
+
+`AgentContext` 虽在运行开始时复制，却会在运行中加入已完成的 assistant message 和带调用 ID 的 tool result，供下一轮模型调用使用；未完成的流式片段和 pending 集合不会被伪装成完整历史。模型和 thinking level 虽然也进入 API 请求，却属于调用配置，不是占用 prompt token 的消息正文。
+
+工具结果进一步展示了字段级拆分。PI 的工具执行结果同时包含 `content` 和 `details`：前者是模型需要看到的文本或图片，后者保存 UI、日志或工具专用结构。转换时会使用 `content` 和 `toolCallId`；`isError` 标记执行是否失败，并在 provider 支持时继续映射。`details`、工具 usage 和消息时间可以留在记录与统计中。一次执行由此可以同时服务模型、界面和运行控制，而不必共享同一份 wire 数据。
+
+这种分层让内部状态可以服务 UI、恢复和调度，不受某一家 LLM 协议限制；provider 适配层只处理整理后的通用消息。模型可见字段也可以单独检查，既减少无关 token，也避免意外发送执行函数和内部数据。
+
 #### Provider 差异由适配层处理
 
 这种角色结构被许多 OpenAI-compatible 接口采用，但不是统一的 LLM 协议。OpenAI 仍支持 Chat Completions，同时[建议新项目使用 Responses API](https://developers.openai.com/api/docs/guides/migrate-to-responses)；Anthropic Messages 则使用顶层 `system`、assistant `tool_use` 和 user `tool_result`。这里选择 Chat Completions，只因为它能用较少字段把四种消息角色和工具配对放在一起。
 
-PI 的[请求适配实现](https://github.com/earendil-works/pi/blob/46bb9a2c3bdb296b0d2179f7309ec6b79a7f3106/packages/ai/src/api/openai-completions.ts)，先维护一套与 provider 无关的内部消息，再在请求发出前转换成目标协议。面向 Chat Completions 时，内部 system prompt 会成为 `developer` 或 `system` 消息，模型历史中的工具调用会成为 `assistant.tool_calls`，工具结果则成为 `tool` 消息；面向 Responses API 时，对应内容会改写为 input message、`function_call` 和 `function_call_output`。这样，上层的上下文组装不必跟随每家 provider 的字段变化。
+PI 的[请求适配实现](https://github.com/earendil-works/pi/blob/46bb9a2c3bdb296b0d2179f7309ec6b79a7f3106/packages/ai/src/api/openai-completions.ts)，负责把前面整理出的通用内容转换成目标协议。面向 Chat Completions 时，system prompt 会成为 `developer` 或 `system` 消息，工具调用和结果会成为 `assistant.tool_calls` 与 `tool`；面向 Responses API 时，对应内容则改写为 input message、`function_call` 和 `function_call_output`。协议字段的差异留在这一步，上层状态不必随 provider 改变。
 
 #### PI 的系统提示组装
 
@@ -174,7 +210,7 @@ Today's date is 2026-08-17.
 
 类似 XML 的标签不是唯一选择。Markdown 标题或其他稳定分隔符也能组织提示，Claude Code 的 `<system-reminder>` 内部本身就在使用 Markdown 标题。标签也不会改变消息角色：放在 user message 里的 `<system-reminder>` 仍然属于 user role，名字中含有 system 不会把它变成 API 的 system prompt。它同样不是安全边界；外部内容也可能带有相似字符串，运行时不能仅凭标签名称就把其中内容当成可信规则。
 
-至此可以把三层概念分开：API role 决定内容在请求中的协议位置，Claude Code 的内部名称描述程序怎样组织材料，类似 XML 的标签只负责在一段文本中标出边界和来源。但这些位置关系还没有回答另一件事：每项材料应该在什么时候读取，旧值又应在什么时候更新。
+至此可以把几层关系分开：运行状态先筛选成模型可见内容，API role 决定它在请求中的协议位置，Claude Code 的内部名称描述提示材料怎样组合，类似 XML 的标签只负责在一段文本中标出边界和来源。第 1 节解决了当前状态怎样进入请求；接下来还要判断每项状态应该在什么时候取得，旧值又应在什么时候更新。
 
 ### 2. 请求材料何时读取、何时更新
 
@@ -256,29 +292,40 @@ Claude Code 对工具结果设置了几层保护：常规结果默认不超过 5
 
 ### 4. Prompt caching 与稳定前缀
 
-#### 精确前缀是缓存命中的前提
+#### 缓存复用的是请求开头的一段计算
 
-Agent loop 会在一次用户任务中多次调用模型。每次工具执行后，旧请求大部分保持不变，只在末尾增加 tool result；下一轮用户消息到来时也是如此。如果旧请求能成为新请求的精确前缀，provider 就有机会复用之前的计算。OpenAI 在 [Unrolling the Codex agent loop](https://openai.com/index/unrolling-the-codex-agent-loop/) 中把这种 append-only 形态作为核心性能设计，并特别提到工具顺序不稳定曾导致 MCP 场景的缓存 miss。
+Agent loop 会在一次用户任务中多次调用模型。每次工具执行后，旧请求大部分保持不变，只在末尾加入新结果。Prompt caching 利用的正是这种关系：provider 保存请求开头一段内容已经完成的计算，后续请求如果具有相同前缀，就可以复用它。
 
-#### PI 与 Claude Code 的稳定前缀
+```text
+请求 1：[稳定规则][工具定义][已有历史]｜缓存边界
+请求 2：[相同规则][相同工具][相同历史]｜缓存边界｜[新增工具结果]
+```
 
-PI 的 provider 适配层会按 API 能力设置缓存。兼容 Anthropic cache control 的 provider 会在 system prompt、最后一个工具和最后一条会话消息上设置断点；OpenAI 请求可以携带 `prompt_cache_key` 和 retention，其中 `prompt_cache_key` 最多 64 个字符。PI 对摘要请求采用单独的缓存设置，因为摘要请求的提示和工具形态与下一轮正常请求不同，它产生的缓存通常难以被正常对话继续复用。
+第一次请求可以把边界之前的计算写入缓存；第二次请求找到相同前缀后，只需继续处理新增尾部。这里把“找到可复用前缀”称为命中，把“没有找到相同前缀”称为未命中。边界之前的内容或顺序发生变化，旧计算便无法继续复用；边界之后追加内容，不会改变已经写入的前缀。
 
-Claude Code 把 system prompt 明确分成稳定前缀和动态尾部。基础身份、通用操作规则和表达规则位于前面；会话工具指导、memory、环境信息、语言、输出风格和 MCP 指令等内容位于后面，两段使用不同的 cache scope。工具池也分别排序内置工具和 MCP 工具，并让内置工具保持为连续前缀；这样新增一个名称排序靠前的 MCP 工具，不会被插进内置工具中间并改变全部后续 key。
+“稳定前缀”不是一个 API 字段，而是 provider 将规则、工具和消息转换成模型输入后，从开头起保持一致的那段内容。“缓存边界”（cache breakpoint）只表示希望可复用的前缀在哪里结束，不是程序调试时使用的断点。OpenAI 在 [Codex agent loop 的说明](https://openai.com/index/unrolling-the-codex-agent-loop/)中也把只在尾部追加新内容作为提高缓存复用率的重要条件。
 
-已经转存或缩短的工具结果也要保持表示稳定。Claude Code 按 `tool_use_id` 记录替换决定，并在后续请求中继续重放同一种结果形式，避免同一条旧结果这一轮是全文、下一轮忽然变成预览，从变化点开始破坏已有提示前缀。
+#### PI 与 Claude Code 怎样保持前缀稳定
 
-缓存参数本身也要稳定。Claude Code 会在会话第一次判断后锁定 1 小时 TTL 的用户资格和 allowlist，避免订阅额度等状态在会话中途翻转，把约 20K token 的前缀从 5 分钟 TTL 改成 1 小时 TTL。部分 beta header 采用“首次启用后保持开启”的方式，原因相同：header 变化也可能改变 provider 实际渲染的提示。系统还会记录 system、tools、cache control、model、beta、effort 和其他请求参数的 hash；响应回来后，只有 cache read 相比上次下降超过 5% 且至少减少 2,000 token，才记为一次显著 cache break，并进一步区分本地配置变化、TTL 到期和可能的服务端驱逐。
+PI 会根据 provider 的能力把同一套缓存选项转换成不同请求字段。Anthropic 风格的 `cache_control` 是附在内容块上的缓存标记，用来指出缓存边界，并可指定缓存有效期。OpenAI 的 `prompt_cache_key` 则是一个路由提示，让具有共同前缀的请求更容易被送到可复用的缓存位置；它不是缓存条目的 ID，也不能代替前缀匹配。PI 提供的短期、长期和关闭缓存选项会映射成各 provider 支持的字段，而不是假定所有 API 使用相同的时长和标记方式。
 
-#### 缓存失效应对应真实变化
+Claude Code 主要通过请求布局保持前缀稳定：基础身份和通用规则放在前面，项目说明、环境变化等会话内容追加在后面；内置工具与 MCP 工具分别保持确定顺序，避免一次工具增减改变整段工具定义的排列。已经转存或缩短的工具结果也会依据对应的 `tool_use_id` 延续同一种表示，避免一条旧结果在后续请求中从全文突然变成预览。
 
-官方 API 给出的原则与这些源码一致。OpenAI 的 [Prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching) 明确要求静态指令、工具和 schema 位于前面，用户特定的变量内容位于后面。Anthropic 的 [Tool use with prompt caching](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-use-with-prompt-caching) 说明缓存按 `tools → system → messages` 形成前缀层级：工具定义变化会让后面的 system 和 messages 缓存一起失效，而通过 tool search 发现的工具以 `tool_reference` 追加到历史中，不改动原有工具前缀。
+缓存设置本身也会成为前缀匹配的一部分。Claude Code 在一次会话中固定是否使用较长有效期，避免同一段内容的缓存标记中途改变。TTL（time to live）指缓存条目可以被复用的有效时间；在 Claude Code 使用的 Anthropic 缓存中，[默认有效期为 5 分钟，也可选择 1 小时](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)。这是该 provider 的设置示例，不同 provider 和模型可能采用不同方式。
 
-所以“什么时候主动失效”不应通过定时插入随机字符串来回答。模型、行为规则、工具 schema、权限或输出配置真的变化时，新请求理应产生不同前缀；缓存达到 TTL 或被服务端驱逐后也会自然 miss。应用要做的是保持没有变化的部分逐字、逐序稳定，并观察 `cached_tokens`、cache read 和 cache creation，而不是为了“确保新鲜”让整段提示每轮变化。
+#### 前缀或缓存设置变化后无法继续复用
+
+模型、系统规则、工具名称、工具 schema 或工具顺序改变时，请求前缀随之改变。缓存边界、有效期或者会影响 provider 最终输入的关键配置发生变化时，即使正文看起来相同，也可能无法复用旧计算。内容没有改变但已超过有效期，或者 provider 提前移除了缓存条目，同样会造成未命中。
+
+所谓“主动失效”，通常不是应用去删除 provider 内部的缓存，而是语义确实变化后发送新的前缀或配置，使旧条目不再匹配。没有变化的内容应保持稳定，不要为了刷新缓存而无意义地扰动它。
+
+Claude Code 会在请求前记录系统提示、工具定义、模型和缓存设置是否改变，响应后再检查缓存读取量是否明显下降。固定快照把“下降超过 5%，并且至少减少 2,000 token”作为告警条件；这只是该项目筛选显著变化的阈值，不是通用的缓存失效标准。
+
+provider 的响应统计可以帮助确认复用是否发生。OpenAI 的 `cached_tokens` 表示本次输入中从缓存复用的 token 数；Anthropic 的 `cache_read_input_tokens` 表示缓存读取量，`cache_creation_input_tokens` 表示本次新写入缓存的输入量。字段名称不同，观察重点相同：稳定前缀没有预期变化时，缓存读取量却明显下降，就需要检查有效期、请求布局和配置是否改变。具体字段语义可分别参考 [OpenAI Prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching) 与 [Anthropic Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)。
 
 #### 缓存不会释放上下文空间
 
-最后仍要强调：缓存复用计算，不释放窗口。一个 150K-token 请求即使命中 140K token 的缓存，模型仍然在 150K-token 的上下文上工作。缓存解决延迟和价格，裁剪与摘要解决容量和注意力，两者不能互换。
+缓存改变的是输入的计算和计费方式，不会把这段输入从本轮请求中删除。一个 150K-token 请求即使有 140K token 来自缓存，模型仍然在 150K-token 的上下文上工作。第 3 节通过内容准入减少第一次进入窗口的材料，第 5 节缩减已经累积的历史；缓存可以降低延迟和费用，不能代替其中任何一种容量控制。
 
 ### 5. 从裁剪到摘要
 
@@ -288,7 +335,7 @@ Claude Code 把 system prompt 明确分成稳定前缀和动态尾部。基础�
 
 #### 先清理可以重新取得的旧结果
 
-Claude Code 的轻量清理只处理文件读取、命令执行、搜索和编辑等可重新执行的工具。较旧的 `tool_result` 正文会被替换成 `[Old tool result content cleared]`，工具调用本身仍然保留，因此模型知道曾经读过或执行过什么。时间触发版本会等服务端缓存很可能已经过期后再清理，并默认保留最近五个可清理结果；另一路 cache editing 可以让服务端删除旧结果而不直接改写本地消息，减少为了节省窗口而破坏已有缓存前缀的代价。
+Claude Code 的轻量清理只处理文件读取、命令执行、搜索和编辑等可重新执行的工具。较旧的 `tool_result` 正文会被替换成 `[Old tool result content cleared]`，工具调用本身仍然保留，因此模型知道曾经读过或执行过什么。时间触发版本会等服务端缓存很可能已经过期后再清理，并默认保留最近五个可清理结果；另一路把清理规则交给 provider，由它在处理请求时从模型可见上下文中移除符合条件的旧结果，本地完整消息不必随之改写。
 
 这种处理适用于“内容已经完成使命，而且能够重新取得”的结果。一次 `git diff`、文件全文或搜索列表可能在当时很重要，但任务推进后只需要结论和路径；用户需求、方案决策和未解决错误则不适合用同样方式清空。Anthropic 的 [Context editing](https://platform.claude.com/docs/en/build-with-claude/context-editing) 也把 tool result clearing 单独设计成一种策略，并提醒：清理会使修改点之后的缓存失效，因此一次应释放足够多的 token，避免为很小收益反复重写缓存。
 
@@ -389,17 +436,19 @@ PI 的溢出恢复同样设置了上限。它区分接近阈值与真实 overflo
 
 > 我理解 Agent 的上下文不是把聊天记录直接拼起来，而是每次调用模型前构建一份请求。里面通常有稳定的系统规则和项目约定、会话开始时取得的环境快照、本轮最新的用户消息和工具结果、工具 schema，以及从历史中选出的摘要和近期原文。在 wire 层，它们最终映射为 provider 支持的请求字段；工具 schema、模型发出的 tool call 和运行时返回的 tool result 是三个不同部分。完整会话应该另外持久化，模型当前看到的只是它的一个受预算约束的版本。
 >
+> 运行状态也不会整体发给模型。以 PI 为例，一次运行开始时只把当前 system prompt、消息和工具复制成上下文快照；自定义消息经过筛选和转换后再进入 provider，模型和 thinking level 作为请求参数。streaming 状态、pending tool calls 和 UI 数据继续留在运行时。工具结果也会拆开：`content` 给模型，`details` 留给 UI 或日志，执行函数始终在 Agent 一侧。
+>
 > 这些内容不会采用同一种刷新频率。像基础行为规则、AGENTS.md 或 CLAUDE.md，通常在会话开始时读取，或者在显式 reload 后更新；初始 Git 状态也可以做快照，但必须告诉模型它不是实时状态。权限、活动工具、文件变化和工具返回会影响下一步是否正确，应该在下一次模型请求或执行相关操作前确认。文件全文和完整日志体积大而且可以重读，更适合按需获取。
 >
 > token 容量控制包含总量预留和内容进入规则。我会先从 context window 中扣掉最大输出和异常恢复需要的空间，再安排系统规则、当前任务和最近几轮原文。当前判断需要、又无法重新取得的内容应完整进入；基础工具直接提供，低频工具通过 tool search 或命名空间保留发现入口；大的工具结果优先落盘，只给模型预览、结论和重新读取路径。PI 分别控制安全预留和近期原文的保留量；Claude Code 还对延迟工具和单次工具结果设置了多层限制。
 >
-> Prompt caching 和压缩要分开理解。缓存要求旧请求成为新请求的精确前缀，所以稳定指令和固定顺序的工具放在前面，环境变化追加在后面。它减少重复计算的延迟和费用，但这些 token 仍在窗口里。压缩才是真正把活动上下文变短，所以不能因为 cache hit 很高就不做上下文治理。
+> Prompt caching 和压缩要分开理解。缓存复用的是相同请求前缀已经完成的计算，所以稳定指令和固定顺序的工具放在前面，环境变化追加在后面。它减少延迟和费用，但被复用的 token 仍在窗口里；缓存读取量很高，也不能代替内容限长和历史压缩。
 >
 > 当上下文继续增长时，我不会直接做一次全量摘要。先限制新工具和大结果，再清理已经用完、可以重新取得的旧 tool result；仍然接近阈值时，摘要较早历史并保留最近原文。摘要至少保留目标、约束、进度、关键选择及理由、下一步、关键文件和错误、失败历史以及用户纠正。文件变更集合、工具 ID 这类确定事实由程序单独保存，不全靠模型概括。
 >
 > 多轮压缩时，用上一版摘要和新增消息更新下一版，并保留近期原文和完整 transcript。切分必须落在完整消息或 API round 边界，不能拆开 tool call 与 tool result。单个结果过大先外置；压缩请求本身也超长时，才按完整消息组丢弃最旧内容并有限重试。PI 和 Claude Code 的实现细节不同，但共同点都是：先控制进入窗口的内容，再逐步增加压缩强度，同时把可恢复的完整状态留在窗口之外。
 
-这段回答的重点不是背出具体阈值，而是把五个关系说清楚：请求上下文与完整记录、启动快照与逐轮更新、完整进入与重新取得、缓存与容量、摘要语义与消息结构。
+这段回答的重点不是背出具体阈值，而是把六个关系说清楚：请求上下文与完整记录、运行状态与模型可见内容、启动快照与逐轮更新、完整进入与重新取得、缓存与容量、摘要语义与消息结构。
 
 ### 9. 追问与展开
 
@@ -410,6 +459,10 @@ PI 的溢出恢复同样设置了上限。它区分接近阈值与真实 overflo
 因为它们的职责和变化频率不同。system prompt 负责持续约束行为，适合稳定；项目说明来自文件，需要保留来源并支持 reload；环境信息里既有启动快照，也有随时可能变化的权限和文件状态。如果全部拼进同一段，任何环境变化都会改写大前缀，既破坏缓存，也让模型难以判断哪部分是长期规则、哪部分只是当时状态。
 
 拆分不一定意味着都使用不同 role。也可以在同一 system prompt 内划出稳定区和动态区，或者把项目说明放进带来源标签的 meta message。关键是来源、更新时间和覆盖关系必须明确。
+
+**Agent 的运行状态是否都要发送给模型？**
+
+不需要。模型只应看到完成当前判断所需的那部分。PI 会把 system prompt、转换后的消息和工具 schema 放进模型上下文，把模型与 thinking level 放进请求参数；streaming、pending tool calls 和错误状态主要用于控制 Agent loop。工具结果中的 `content` 会进入模型历史，`details` 留给 UI 或日志；工具的本地执行函数和调用时检查也必须留在运行时。需要让模型知道某个状态时，应显式转换成消息或工具结果，而不是序列化整个状态对象。
 
 **会话快照过期后如何处理？**
 
@@ -435,7 +488,7 @@ PI 的溢出恢复同样设置了上限。它区分接近阈值与真实 overflo
 
 **什么时候应该主动让缓存失效？**
 
-当继续使用旧前缀会表达错误语义时，例如模型、系统规则、工具 schema 或权限配置真的改变。不要为了刷新日期或制造唯一请求而在稳定前缀里加入随机值。可变信息追加在后面，并通过 cache read、cache creation 或 cached tokens 验证是否真的命中。
+当模型、系统规则、工具 schema、权限或缓存设置真的改变时，应发送反映新语义的前缀；旧缓存因为不再匹配而自然失效。内容未变但超过有效期，或 provider 提前移除条目，也会造成未命中。可以用响应统计验证：OpenAI 的 `cached_tokens` 是本次复用的输入 token，Anthropic 的缓存读取量和写入量分别说明复用了多少、又新缓存了多少。没有语义变化时，不必为了“刷新”而改动稳定前缀。
 
 #### 压缩可靠性
 
