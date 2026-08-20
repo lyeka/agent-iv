@@ -116,32 +116,43 @@ Provider 还可能支持 Output Schema、Strict Mode、延迟加载或协议 Ann
 
 PI 对这些消费者进行了分层。底层 `Tool` 主要保存名称、描述和参数 Schema；`AgentTool` 再增加参数准备、执行函数和执行模式；Coding Agent 的扩展定义继续增加提示片段与 UI Renderer。Claude Code 的产品运行时更集中，`Tool` 类型同时暴露 `call`、`isReadOnly(input)`、`isConcurrencySafe(input)`、`checkPermissions`、结果映射和 Renderer。两种组织方式都按照消费者职责分配字段，发给模型的 Definition 无须承载 Tool 系统的全部能力。
 
-### 会话内保持模型可见描述稳定
+### 先区分模型接口与调用说明
 
-PI 的底层 `Tool.description` 是静态字符串。Claude Code 的接口允许计算两种说明：`prompt(options)` 生成模型可见描述，`description(input, options)` 可以根据本次输入生成权限确认和 UI 文案。源码进一步用 Session 级 Schema Cache 固定 `prompt()` 首次生成的基础定义，后续请求只叠加延迟加载、缓存控制等请求级属性。
+讨论“Tool 描述应该静态还是动态”以前，先要确认这段文字给谁看。同一个 Bash Tool 至少涉及两类说明：模型需要一段稳定的能力描述，例如“执行 Shell 命令并返回结果”；用户面对具体调用时，则需要知道这次操作会做什么。`git status --short` 可以显示成“读取当前仓库状态”，`rm -rf build` 则应该明确显示成“删除 build 目录”。后两句话必须读取本次 Input，无法由一段通用描述代替。
 
-模型说明可以按三种方式更新：
+这两类内容承担不同职责：
 
-- 根据操作系统、租户能力或已安装插件在会话初始化时生成一次，能让描述符合真实环境；
-- 根据本次命令生成“将读取仓库状态”一类确认文案，能帮助用户判断具体动作；
-- 每轮改写模型可见描述，则会改变模型面对的接口，造成 Prompt Cache 失效、行为漂移和会话难以复现。
+- **模型接口描述**进入 Tool Definition，帮助模型判断什么时候选择 Bash、应该生成什么参数；
+- **调用说明**进入权限确认和 UI，帮助用户判断这一次具体操作是否符合预期。
 
-据此，模型可见定义适合在一次会话或稳定目录版本内保持不变。输入相关的解释放在审批与 UI 层，实时环境状态通过普通上下文或查询 Tool 提供。
+PI 的底层 `Tool.description` 是静态的模型接口描述。Claude Code 把两类内容显式分开：`prompt(options)` 生成 API Definition 中的模型描述，`description(input, options)` 根据具体参数和权限上下文生成用户可见说明。`toolToAPISchema` 首次调用 `prompt()` 后，会把名称、描述和 Input Schema 等基础字段放入 Session 级 Schema Cache，后续请求直接复用。
 
-### 每个 Turn 使用固定的工具目录快照
+动态能力仍然有必要，只是两类内容的更新时间不同。模型接口可以在会话建立或可用 Tool 列表更新时，根据 Shell 类型、租户能力和已经安装的 Tool 生成一次；调用说明则要在每次执行前，根据 Input 和当前权限状态重新生成。实时业务数据不适合写进模型接口，可以通过普通上下文或专门的查询 Tool 提供。
 
-运行中增删 Tool 可以解决三类问题：权限变化时隐藏能力，插件或 MCP Server 连接后引入新能力，以及在大目录中延迟加载暂时用不到的 Schema。OpenAI Agents SDK 的 `is_enabled`、Anthropic Tool Search 和 Claude Code 的 MCP 刷新都属于这类能力。
+模型接口需要按 Definition 版本保持稳定，是因为它位于模型请求的前缀。Anthropic 的请求会先序列化 Tools，再放入 System Prompt 和 Messages；Prompt Cache 复用的是这段字节前缀。如果同一个 Tool 每轮重新生成不同描述，整个后续前缀都会失去缓存，同一段 Transcript 在重放时也会面对不同的接口语义。
 
-模型产生 Call 后，当前 Turn 的目录快照应保持固定。PI 在运行开始时复制当前 Tool 数组，Coding Agent 在下一 Turn 的准备阶段更新 Active Tools；Claude Code 也在当前 Tool Batch 结束后调用 `refreshTools()`，新连接的 MCP Tool 从下一轮开始可见，正在执行的批次继续使用创建 Executor 时的定义。
+因此，“支持动态描述”不是要求所有说明一起变化：模型接口可以在版本建立时生成一次，随后保持稳定；用户调用说明按 Input 动态生成。单个 Tool 的描述保持稳定，不表示所有 Tool 都必须从第一轮开始加载。
 
-一个可复现的实现至少需要：
+### Tool 多时，先搜索，再加载完整 Schema
 
-- 当前 Turn 使用不可变目录快照；
-- 目录变化只影响下一 Turn，并记录稳定名称或目录版本；
-- 已经生成的 Call 按产生它的快照解释；
-- Definition 使用确定性顺序。
+Tool 很少时，Runtime 可以把全部 Definition 发给模型。Tool 很多时，每个 Tool 的描述和 Input Schema 会持续占用 Context，大量无关定义也会干扰模型选择。此时 Runtime 可以在初始请求中只发送常用 Tool 的完整 Definition，再提供一个 `ToolSearch`；延迟加载的 Tool 先只出现名称，完整 Schema 暂不进入模型上下文。
 
-确定性顺序服务于 Prompt Cache 和问题复现。Anthropic 的请求缓存把 Tools 放在 System Prompt 和 Messages 之前，同一组工具每轮随机排序会改变请求前缀。业务路由依靠名称、描述、Schema 和当前任务，列表位置不表示 Tool 的优先级。
+Claude Code 公开快照的 `src/tools/ToolSearchTool/ToolSearchTool.ts` 中，`ToolSearchTool` 做的是本地词法搜索。模型负责把用户意图写成搜索词，Runtime 只执行一套确定性的匹配和排序算法。以 `ToolSearch(query: "database query")` 搜索 `query_database` 为例：
+
+1. 查询先转成小写，再按空格拆成 `database` 和 `query`。Tool 名称按 CamelCase 和下划线拆分，所以 `QueryDatabase` 与 `query_database` 都会得到 `query`、`database` 两段。
+2. Runtime 只给尚未加载的候选 Tool 计分。每个查询词与名称分段完全相等加 10 分，被某个名称分段包含加 5 分；命中 `searchHint` 加 4 分；名称的规范化完整形式命中、且候选此前尚未得分时兜底加 3 分；Description 按单词边界命中再加 2 分。
+3. `query_database` 的两个名称分段分别精确命中，因此仅名称就得到 20 分。如果它的 `searchHint` 是 `database query`，Description 是 `Run a database query and return rows`，两个词还会分别得到 4 分和 2 分，总分为 32。
+4. Runtime 过滤零分候选，按总分倒序排列，默认返回前 5 个。查询中的 `+database` 表示必选词：候选的名称、Description 或 `searchHint` 必须命中所有带 `+` 的词，才会进入计分阶段。
+
+还有一条不经过排序的路径：`select:query_database` 直接按完整名称选择 Tool。关键词搜索也会优先处理与完整 Tool 名称完全相等的查询。
+
+搜索结果只返回 `tool_reference`，不是把执行器交给模型。`src/utils/toolSearch.ts` 中的 `extractDiscoveredToolNames()` 从消息历史识别这些引用，后续请求才加入命中 Tool 的完整 Schema；模型拿到 Schema 后，才能生成 `query_database(sql, database)` Call。
+
+这套搜索没有使用 Embedding、向量数据库或另一个 LLM，也没有内置同义词扩展、翻译和拼写纠错。模型可能根据中文用户请求主动生成英文查询 `database query`；如果它直接提交 `查询数据库`，而 Tool 的名称、Description 和 `searchHint` 只有英文，Runtime 不会自动把中文语义匹配到 `query_database`。因此，Tool 的命名和搜索元数据会直接影响召回率。
+
+PI 没有内置通用 Tool Search，只提供动态激活 Tool 的扩展能力。它的回归测试中，普通 Extension Tool `load_more_tools` 执行时调用 `pi.setActiveTools()`，把预先注册的 `after_load` 加入 Active Tools；PI 记录这个变化，并在后续模型请求中提供 `after_load` 的 Schema。
+
+加载哪个 Tool、怎样找到它，都由 Extension 自己决定。测试只是写死了 `after_load`；实际项目可以在这个普通 Tool 中实现关键词、规则或语义检索。这里所说的 Loader Tool 只是一种扩展用法，不是 PI 的内置类型。相比之下，Claude Code 把通用加权关键词搜索直接做进了 Runtime。两种方式都能把完整 Schema 推迟到真正需要时再加载，但 Tool 数量少时，直接预加载全部 Definition 更简单。
 
 Definition 帮助模型产生结构化 Call。Call 进入宿主后，还要经过语义判断和权限裁决才能执行。
 
@@ -238,11 +249,9 @@ PI 的 Bash 输出累积器保留尾部；一旦超过行数或字节限制，�
 
 MCP 可以直接映射到前面的三个对象：
 
-- `tools/list` 让 Client 发现 Tool Definition 和当前 Catalog；
+- `tools/list` 让 Client 发现当前可用的 Tool Definition 列表，这份可用能力列表也常被称为 Tool Catalog；
 - `tools/call` 把名称与参数作为 Call 发给 Server；
 - Call Tool Result 用 `content`、`structuredContent`、`isError` 和 `_meta` 表达 Outcome。
-
-`notifications/tools/list_changed` 还能通知 Client 目录已经变化。该通知使旧目录失效，具体在当前 Batch 还是下一 Turn 刷新由 Host 决定。
 
 这套标准化减少了重复 Adapter。一个 MCP Server 可以被多个 Host 发现和调用，输入与输出 Schema、错误标记、多模态内容和资源引用也有共同表示。跨进程、跨语言、跨 Host 复用的 Tool 很适合采用 MCP；少量进程内函数通常使用本地类型和直接调用更轻。
 
@@ -250,7 +259,7 @@ MCP 覆盖 Host 与 Tool Server 之间的协议交互，本地权限、审批体
 
 MCP 为 Definition、Call 和 Outcome 建立跨边界的传输协议，Host 需要继续完成本地 Tool Runtime 的设计。
 
-沿着一次调用回看，Tool 系统的各项设计都在维护三段关系：模型通过稳定清楚的 Definition 提出请求；宿主验证并授权所有外部动作；Outcome 记录结果并为下一步保留可行动信息。动态目录决定下一轮有哪些 Definition，并发影响 Call 的调度，大结果治理约束 Outcome 的投影，MCP 则让三者跨越进程和语言边界。
+沿着一次调用回看，Tool 系统的各项设计都在维护三段关系：模型通过稳定清楚的 Definition 提出请求；宿主验证并授权所有外部动作；Outcome 记录结果并为下一步保留可行动信息。Tool Search 决定哪些按需 Definition 进入模型请求，并发影响 Call 的调度，大结果治理约束 Outcome 的投影，MCP 则让三者跨越进程和语言边界。
 
 # 第二部分：面试时怎么回答
 
@@ -266,7 +275,7 @@ MCP 为 Definition、Call 和 Outcome 建立跨边界的传输协议，Host 需�
 >
 > 工具执行结束后，Runtime 把函数返回值整理为 Tool Outcome。模型获得可行动的 Content，SDK 或 UI 使用结构化详情，日志保存 Trace 和诊断字段。参数错误、权限拒绝和可恢复执行失败也会形成带 Call ID 的 Error Result，让模型修参、换 Tool 或上报；协议损坏、进程故障和 Run 级中断则会打断循环。
 >
-> 大结果先在数据源处过滤或分页，再做语义化 Preview；完整内容放到上下文外并返回引用，同时限制单结果和整批结果。动态工具目录按 Turn 切换稳定快照，Definition 采用确定性顺序，从而避免目录竞态和 Prompt Cache 抖动。
+> 大结果先在数据源处过滤或分页，再做语义化 Preview；完整内容放到上下文外并返回引用，同时限制单结果和整批结果。Tool 少时可以预加载全部 Definition；Tool 多时只发送常用 Tool 和 Tool Search，命中后再加载完整 Schema。Claude Code 的搜索是名称、Description 和 `searchHint` 的加权关键词匹配，不是向量语义搜索；这种延迟加载能节省 Context，但会增加一次往返，并依赖搜索元数据和 Provider 能力。Definition 列表采用确定性顺序，以便复现并复用 Prompt Cache。
 >
 > 跨进程和跨语言复用 Tool 时，MCP 可以统一发现、Schema、调用和结果的传输。权限、沙箱、并发、重试、Context Budget 和 UI 归 Host Runtime 负责。责任边界由此明确下来：模型提出调用，宿主拥有执行权，Outcome 关闭循环。
 
@@ -278,7 +287,7 @@ MCP 为 Definition、Call 和 Outcome 建立跨边界的传输协议，Host 需�
 
 ### 2）描述应该静态还是动态？
 
-模型可见描述应在会话或稳定目录版本内保持不变。初始化时可以根据 OS、租户权限和已安装能力生成一次；权限弹窗和 UI 文案可以按本次 Input 动态生成。每轮改写模型描述会造成 Prompt Cache 失效、模型行为漂移和会话难以复现。
+先看描述给谁使用。给模型看的接口描述可以在会话建立或可用 Tool 列表更新时，根据 OS、租户权限和已安装能力生成一次，随后按 Definition 版本保持稳定；给用户看的权限和 UI 说明则应根据本次 Input 动态生成。每轮改写模型接口会破坏 Prompt Cache，也会让同一段历史面对不同的 Tool 语义。
 
 ### 3）怎样声明只读、破坏性和权限确认？
 
@@ -298,7 +307,7 @@ Tool 实现内部可以抛异常，Executor 在单次调用边界捕获可恢复
 
 ### 7）工具集能否动态增删？
 
-可以，适合权限过滤、插件接入、MCP 热连接和大目录延迟加载。当前 Turn 应持有不可变快照，变化从下一 Turn 生效，并记录稳定名称或目录版本。需要防范的风险包括 Definition 与执行时不一致、名称冲突、缓存抖动和历史无法复现。
+可以。Tool 少时我会预加载全部 Definition；Tool 多时再按需加载 Schema。Claude Code 内置了加权关键词搜索；PI 提供的是 Extension Tool 激活其他已注册 Tool 的能力，具体搜索策略由 Extension 自己实现。按需加载能节省 Context、减少无关 Tool 干扰，代价是多一次往返和搜索遗漏；Provider 不支持时就退回完整预加载。
 
 ### 8）什么时候并发，工具列表顺序有讲究吗？
 
