@@ -1,0 +1,436 @@
+/*
+ * Whitey adaptation for VS Code's built-in Markdown Preview.
+ * Upstream theme: https://github.com/typora/typora-default-themes/blob/master/themes/whitey.css
+ * Typora-only editor selectors are intentionally omitted.
+ */
+
+:root {
+  --whitey-background: #fefefe;
+  --whitey-foreground: #333;
+  --whitey-border: #ddd;
+  --whitey-link: #2484c1;
+  --whitey-code-background: #fbfaf7;
+  --whitey-code-border: #e7e3da;
+  --whitey-code-foreground: #3f3b35;
+  --whitey-inline-code-background: #f8f8f6;
+  --whitey-inline-code-border: #eeeeeb;
+  --whitey-inline-code-foreground: #70706c;
+  --whitey-muted-background: #f8f8f8;
+  --whitey-muted-foreground: #777;
+  --whitey-body-font:
+    "ChillKai",
+    "Songti SC",
+    STSong,
+    serif;
+  --whitey-heading-font: var(--whitey-body-font);
+  --whitey-code-font:
+    "Berkeley Mono",
+    Iosevka,
+    Consolas,
+    Menlo,
+    Monaco,
+    "SFMono-Regular",
+    monospace;
+}
+
+html {
+  padding: 0;
+  background: var(--whitey-background);
+  font-size: 16px;
+}
+
+html,
+body {
+  margin: auto;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  max-width: 960px;
+  min-height: 100vh;
+  margin-bottom: 2em;
+  padding: 40px clamp(30px, 5vw, 60px) 64px;
+  color: var(--whitey-foreground);
+  background: var(--whitey-background);
+  font-family: var(--whitey-body-font);
+  font-size: 1rem;
+  line-height: 1.53;
+  text-align: justify;
+  text-rendering: optimizeLegibility;
+}
+
+@media only screen and (min-width: 1400px) {
+  body {
+    max-width: 1100px;
+  }
+}
+
+/* Typography */
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  padding-bottom: 0;
+  border-bottom: 0;
+  color: var(--whitey-foreground);
+  font-family: var(--whitey-body-font);
+  line-height: 1.3;
+}
+
+h1,
+h2 {
+  font-family: var(--whitey-heading-font);
+  font-weight: 400;
+  letter-spacing: 0.04em;
+}
+
+h1 {
+  margin-top: 1.4em;
+  font-size: 1.8rem;
+  font-weight: normal;
+}
+
+h2 {
+  margin-top: 1.8em;
+  font-size: 1.42rem;
+  font-weight: normal;
+}
+
+h3 {
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 1.8em;
+  padding-bottom: 0.35em;
+  border-bottom: 1px solid #dfdbd2;
+  color: #4b463f;
+  font-size: 1.27rem;
+  font-weight: normal;
+  font-style: normal;
+  letter-spacing: 0.05em;
+}
+
+h1,
+h2 {
+  text-align: center;
+}
+
+h3,
+h4,
+h5,
+h6 {
+  text-align: left;
+}
+
+h4 {
+  margin-top: 1.6em;
+  font-size: 1.13rem;
+}
+
+h5 {
+  margin-top: 1.5em;
+  font-size: 1rem;
+}
+
+h6 {
+  margin-top: 1.5em;
+  font-size: 0.89rem;
+}
+
+h2::after {
+  display: block;
+  width: 100px;
+  height: 1px;
+  margin: 0.35em auto 0;
+  border-bottom: 1px solid #2f2f2f;
+  content: "";
+}
+
+h1 + h2,
+h2 + h3 {
+  margin-top: 0.83em;
+}
+
+p {
+  margin-top: 0;
+  margin-bottom: 1em;
+  hyphens: auto;
+}
+
+strong {
+  font-weight: bold;
+}
+
+a {
+  color: var(--whitey-link);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+h1 a,
+h1 a:hover {
+  color: var(--whitey-foreground);
+  text-decoration: none;
+}
+
+ul {
+  padding-left: 1.2em;
+  list-style: square;
+}
+
+ol {
+  padding-left: 1.2em;
+}
+
+li {
+  margin: 0.2em 0;
+}
+
+li > p {
+  margin-bottom: 0.45em;
+}
+
+blockquote {
+  margin: 1.2em 0 1.2em 1em;
+  padding: 0.1em 0 0.1em 1em;
+  border-left: 1px solid var(--whitey-border);
+  border-radius: 0;
+  color: inherit;
+  background: transparent;
+}
+
+blockquote > :first-child {
+  margin-top: 0;
+}
+
+blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+hr {
+  height: 1px;
+  margin: 2em 0;
+  border: 0;
+  border-top: 1px solid var(--whitey-border);
+  color: var(--whitey-border);
+}
+
+/* Code */
+
+pre {
+  font-family: var(--whitey-code-font);
+}
+
+code {
+  padding: 0.08em 0.28em;
+  border: 1px solid var(--whitey-inline-code-border);
+  border-radius: 2px;
+  color: var(--whitey-inline-code-foreground);
+  background: var(--whitey-inline-code-background);
+  font-family: var(--whitey-body-font);
+  font-size: 1em;
+}
+
+pre {
+  margin: 0 0 1.5em 1em;
+  border: 1px solid var(--whitey-code-border);
+  border-radius: 0;
+  color: var(--whitey-code-foreground);
+  background: var(--whitey-code-background);
+  font-size: 0.9em;
+  overflow: auto;
+}
+
+pre:not(.hljs),
+pre.hljs code > div {
+  padding: 6px 8px 8px 1em;
+}
+
+pre code {
+  padding: 0;
+  border: 0;
+  color: var(--whitey-code-foreground);
+  background: transparent;
+  font-family: inherit;
+  font-size: 1em;
+}
+
+pre,
+pre.hljs,
+pre.hljs code > div {
+  background: var(--whitey-code-background);
+}
+
+.code-block-copy-button {
+  border-color: var(--whitey-code-border);
+  color: var(--whitey-muted-foreground);
+  background: var(--whitey-code-background);
+}
+
+.code-block-copy-button:hover {
+  background: var(--whitey-muted-background);
+}
+
+/* Low-saturation ink palette inspired by traditional Chinese book printing. */
+.hljs-comment,
+.hljs-quote {
+  color: #969083;
+  font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-subst {
+  color: #66584d;
+  font-weight: 600;
+}
+
+.hljs-string,
+.hljs-doctag,
+.hljs-regexp {
+  color: #4f6b67;
+}
+
+.hljs-number,
+.hljs-literal,
+.hljs-variable,
+.hljs-template-variable {
+  color: #7b684c;
+}
+
+.hljs-title,
+.hljs-section,
+.hljs-selector-id {
+  color: #5f596a;
+}
+
+.hljs-attr,
+.hljs-attribute,
+.hljs-name,
+.hljs-selector-class,
+.hljs-type,
+.hljs-built_in,
+.hljs-builtin-name {
+  color: #596760;
+}
+
+.hljs-meta,
+.hljs-symbol,
+.hljs-bullet {
+  color: #776b59;
+}
+
+.hljs-addition {
+  color: #5f765e;
+  background: #f0f4ec;
+}
+
+.hljs-deletion {
+  color: #8c625b;
+  background: #f7eeee;
+}
+
+/* Tables and media */
+
+table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  margin: 0 auto 1.333333rem;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+table th,
+table td {
+  padding: 8px;
+  border: 0;
+  border-top: 1px solid var(--whitey-border);
+  line-height: 1.333333rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+table th {
+  background: transparent;
+  font-weight: bold;
+}
+
+table thead:first-child tr:first-child th,
+table thead:first-child tr:first-child td {
+  border-top: 0;
+}
+
+table tbody + tbody {
+  border-top: 2px solid var(--whitey-border);
+}
+
+body.vscode-dark table th,
+body.vscode-dark table td {
+  border-color: var(--whitey-border);
+}
+
+img,
+video {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 1.5em auto;
+  border: 0;
+}
+
+/* VS Code-specific Markdown elements */
+
+.contains-task-list {
+  padding-left: 0;
+}
+
+.task-list-item {
+  padding-left: 1.6rem;
+  list-style: none;
+}
+
+.task-list-item > input[type="checkbox"] {
+  margin-left: -1.3em;
+  margin-right: 0.3em;
+  vertical-align: middle;
+}
+
+table.frontmatter {
+  width: 100%;
+  margin-top: -1rem;
+  color: var(--whitey-muted-foreground);
+  background: var(--whitey-muted-background);
+  font-size: 0.76em;
+}
+
+table.frontmatter th,
+table.frontmatter td {
+  border-color: var(--whitey-border);
+}
+
+@media only screen and (max-width: 700px) {
+  body {
+    padding: 28px 24px 48px;
+  }
+}
+
+@media print {
+  html {
+    font-size: 13px;
+  }
+
+  body {
+    max-width: none;
+    padding: 0;
+  }
+
+  .code-block-copy-button {
+    display: none;
+  }
+}
