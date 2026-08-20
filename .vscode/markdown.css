@@ -6,7 +6,7 @@
 
 :root {
   --whitey-background: #fefefe;
-  --whitey-foreground: #333;
+  --whitey-foreground: #292724;
   --whitey-border: #ddd;
   --whitey-link: #2484c1;
   --whitey-code-background: #fbfaf7;
@@ -36,13 +36,13 @@
 html {
   padding: 0;
   background: var(--whitey-background);
-  font-size: 16px;
+  font-size: 17px;
 }
 
 html,
 body {
   margin: auto;
-  -webkit-font-smoothing: antialiased;
+  -webkit-font-smoothing: auto;
 }
 
 body {
